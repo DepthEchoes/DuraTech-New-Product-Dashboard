@@ -1138,24 +1138,28 @@ function renderCharts() {{
       }}
     }});
   }});
+  // 初始化/重建图表时同步刷新顶部统计，确保与加载到的进度（localStorage/服务器）一致
+  updateStats();
 }}
 
 function refreshCharts() {{
-  const progressCounts = PROGRESS_STAGES.map(s => PRODUCTS.filter(p => p._progress === s).length);
-  const labelMap = {{}};
-  PRODUCTS.forEach(p => {{ const l = p.__label__ || '未标记'; labelMap[l] = (labelMap[l] || 0) + 1; }});
-  const catMap = {{}};
-  PRODUCTS.forEach(p => {{ const c = CATEGORY_SHORT[p.category] || p.category || '其他'; catMap[c] = (catMap[c] || 0) + 1; }});
-  
-  ['chartProgress','chartLabel','chartCategory'].forEach(id => {{
-    if (!chartInstances[id]) return;
-    if (id === 'chartProgress') chartInstances[id].data.datasets[0].data = progressCounts;
-    if (id === 'chartLabel') {{ chartInstances[id].data.labels = Object.keys(labelMap); chartInstances[id].data.datasets[0].data = Object.values(labelMap); }}
-    if (id === 'chartCategory') {{ chartInstances[id].data.labels = Object.keys(catMap); chartInstances[id].data.datasets[0].data = Object.values(catMap); }}
-    chartInstances[id].update();
-  }});
-  
+  // 先刷新顶部统计，保证不因图表渲染异常而遗漏
   updateStats();
+  try {{
+    const progressCounts = PROGRESS_STAGES.map(s => PRODUCTS.filter(p => p._progress === s).length);
+    const labelMap = {{}};
+    PRODUCTS.forEach(p => {{ const l = p.__label__ || '未标记'; labelMap[l] = (labelMap[l] || 0) + 1; }});
+    const catMap = {{}};
+    PRODUCTS.forEach(p => {{ const c = CATEGORY_SHORT[p.category] || p.category || '其他'; catMap[c] = (catMap[c] || 0) + 1; }});
+    
+    ['chartProgress','chartLabel','chartCategory'].forEach(id => {{
+      if (!chartInstances[id]) return;
+      if (id === 'chartProgress') chartInstances[id].data.datasets[0].data = progressCounts;
+      if (id === 'chartLabel') {{ chartInstances[id].data.labels = Object.keys(labelMap); chartInstances[id].data.datasets[0].data = Object.values(labelMap); }}
+      if (id === 'chartCategory') {{ chartInstances[id].data.labels = Object.keys(catMap); chartInstances[id].data.datasets[0].data = Object.values(catMap); }}
+      chartInstances[id].update();
+    }});
+  }} catch (e) {{}}
 }}
 
 function updateStats() {{
