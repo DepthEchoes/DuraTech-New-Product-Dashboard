@@ -82,6 +82,22 @@ def logout(token):
     conn.close()
 
 
+def change_password(user_id, new_password, invalidate_sessions=True):
+    """修改指定用户密码。返回 (ok, error)。
+    invalidate_sessions=True 时一并清除该用户所有会话，避免旧 token 继续可用。"""
+    if not new_password or len(new_password) < 6:
+        return False, "密码至少 6 位"
+    conn = get_conn()
+    conn.execute(
+        "UPDATE users SET password_hash=? WHERE id=?",
+        (generate_password_hash(new_password), user_id))
+    if invalidate_sessions:
+        conn.execute("DELETE FROM sessions WHERE user_id=?", (user_id,))
+    conn.commit()
+    conn.close()
+    return True, None
+
+
 def get_user_by_token(token):
     """按 token 查用户；过期/不存在返回 None"""
     if not token:

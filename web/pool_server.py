@@ -22,7 +22,8 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from db import (init_db, load_latest_pool, load_canonical_asins,
                 write_pending_transfer, save_progress, get_all_progress)
 from auth import (register, login, logout, get_user_by_token,
-                  login_required, admin_required)
+                  login_required, admin_required, change_password)
+from werkzeug.security import check_password_hash
 from tasks import job_manager, POOL_HTML, TRACKING_HTML
 from config import SESSIONS_DIR
 
@@ -149,6 +150,39 @@ def api_user_delete(uid):
     conn.execute("DELETE FROM users WHERE id=?", (uid,))
     conn.commit()
     conn.close()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/users/<int:uid>/reset-password", methods=["POST"])
+@admin_required
+def api_user_reset_password(uid):
+    """管理员重置任意用户密码（该用户会话同时失效）"""
+    from flask import g
+    data = request.get_json(force=True, silent=True) or {}
+    ok, err = change_password(uid, data.get("password", ""))
+    if not ok:
+        return jsonify({"ok": False, "error": err}), 400
+    return jsonify({"ok": True})
+
+
+@app.route("/api/auth/change-password", methods=["POST"])
+@login_required
+def api_change_password():
+    """用户修改自己的密码（需校验原密码）"""
+    from flask import g
+    from db import get_conn
+    data = request.get_json(force=True, silent=True) or {}
+    old_pw = data.get("old_password", "")
+    new_pw = data.get("new_password", "")
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT id, password_hash FROM users WHERE id=?", (g.user["id"],)).fetchone()
+    conn.close()
+    if not row or not check_password_hash(row["password_hash"], old_pw):
+        return jsonify({"ok": False, "error": "原密码错误"}), 400
+    ok, err = change_password(g.user["id"], new_pw)
+    if not ok:
+        return jsonify({"ok": False, "error": err}), 400
     return jsonify({"ok": True})
 
 

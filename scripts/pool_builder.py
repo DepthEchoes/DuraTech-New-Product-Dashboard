@@ -58,9 +58,24 @@ WEB_HEADER_EXTRA = """
   </div>
 </div>
 
+<!-- 用户管理弹窗（仅管理员可见入口） -->
+<div id="userMgmtModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:2000;align-items:center;justify-content:center" onclick="if(event.target===this)closeUserMgmt()">
+  <div style="background:#fff;border-radius:12px;width:520px;max-width:94vw;max-height:86vh;overflow:auto;padding:20px 22px;box-shadow:0 12px 48px rgba(0,0,0,.25)">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+      <b style="font-size:16px;color:#2F5496">⚙ 用户管理</b>
+      <span onclick="closeUserMgmt()" style="cursor:pointer;font-size:22px;color:#999;line-height:1">&times;</span>
+    </div>
+    <div id="userList"></div>
+    <div style="margin-top:16px;border-top:1px solid #eee;padding-top:12px">
+      <button onclick="showChangeMine()" style="background:#2F5496;color:#fff;border:none;padding:7px 14px;border-radius:6px;cursor:pointer;font-size:12px;font-family:inherit">🔑 修改我的密码</button>
+    </div>
+  </div>
+</div>
+
 <!-- 右上角用户信息 + Cookie 按钮容器（由 JS 动态注入到 header） -->
 <div id="headerRight" style="display:none;align-items:center;gap:10px">
   <button id="cookieBtn" onclick="toggleCollectCard()" title="上传卖家精灵 Cookie" style="background:rgba(255,255,255,.15);color:#fff;border:1px solid rgba(255,255,255,.3);padding:5px 12px;border-radius:6px;cursor:pointer;font-size:12px;font-family:inherit;white-space:nowrap">🍪 Cookie</button>
+  <button id="userMgmtBtn" onclick="openUserMgmt()" title="用户管理" style="background:rgba(255,255,255,.15);color:#fff;border:1px solid rgba(255,255,255,.3);padding:5px 12px;border-radius:6px;cursor:pointer;font-size:12px;font-family:inherit;white-space:nowrap;display:none">⚙ 用户</button>
   <span id="headerUser" style="font-size:13px;opacity:.9">👤 <b></b></span>
   <button id="logoutBtn" onclick="doLogout()" style="background:rgba(220,53,69,.8);color:#fff;border:none;padding:5px 12px;border-radius:6px;cursor:pointer;font-size:12px;font-family:inherit">退出</button>
 </div>
@@ -98,6 +113,8 @@ function showUser(u) {
     // 只在首次时移动到 header（避免重复）
     if (!area.contains(hr)) area.appendChild(hr);
     document.querySelector('#headerUser b').textContent = u.username + (u.is_admin ? ' (管理员)' : '');
+    const umb = document.getElementById('userMgmtBtn');
+    if (umb) umb.style.display = u.is_admin ? 'inline-block' : 'none';
   }
 }
 async function doLogin() {
@@ -126,6 +143,55 @@ function doLogout() {
   const t = getToken();
   if (t) { fetch('/api/auth/logout', { method: 'POST', headers: { 'Authorization': 'Bearer ' + t } }).catch(() => {}); }
   localStorage.removeItem(TOKEN_KEY); clearAuthCookie(); showLogin(); showToast('已退出登录');
+}
+
+// ============ 在线版：用户管理（管理员） ============
+function openUserMgmt() {
+  document.getElementById('userMgmtModal').style.display = 'flex';
+  loadUsers();
+}
+function closeUserMgmt() { document.getElementById('userMgmtModal').style.display = 'none'; }
+async function loadUsers() {
+  try {
+    const d = await api('/api/users');
+    const box = document.getElementById('userList');
+    box.innerHTML = '';
+    (d.users || []).forEach(u => {
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:9px 4px;border-bottom:1px solid #f0f0f0';
+      const left = document.createElement('div');
+      left.textContent = '👤 ' + u.username + (u.is_admin ? ' (管理员)' : '') + '  #' + u.id;
+      const btn = document.createElement('button');
+      btn.textContent = '重置密码';
+      btn.style.cssText = 'background:#dc3545;color:#fff;border:none;padding:5px 12px;border-radius:5px;cursor:pointer;font-size:12px;font-family:inherit';
+      btn.onclick = () => resetUserPassword(u.id, u.username);
+      row.appendChild(left); row.appendChild(btn);
+      box.appendChild(row);
+    });
+    if (!d.users || !d.users.length) box.textContent = '（暂无其他用户）';
+  } catch (e) { showToast(e.message); }
+}
+async function resetUserPassword(uid, username) {
+  const np = prompt('为「' + username + '」设置新密码（至少 6 位）');
+  if (!np) return;
+  if (np.length < 6) { showToast('密码至少 6 位'); return; }
+  try {
+    await api('/api/users/' + uid + '/reset-password', { method: 'POST', body: JSON.stringify({ password: np }) });
+    showToast('✅ 已重置 ' + username + ' 的密码');
+  } catch (e) { showToast(e.message); }
+}
+async function showChangeMine() {
+  const oldp = prompt('输入当前密码');
+  if (!oldp) return;
+  const newp = prompt('输入新密码（至少 6 位）');
+  if (!newp) return;
+  if (newp.length < 6) { showToast('新密码至少 6 位'); return; }
+  try {
+    await api('/api/auth/change-password', { method: 'POST', body: JSON.stringify({ old_password: oldp, new_password: newp }) });
+    showToast('✅ 密码已修改，请重新登录');
+    closeUserMgmt();
+    doLogout();
+  } catch (e) { showToast(e.message); }
 }
 
 // ============ 在线版：Cookie 上传 + 采集 ============
