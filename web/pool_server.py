@@ -20,7 +20,7 @@ sys.path.insert(0, str(WEB_DIR))
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from db import (init_db, load_latest_pool, load_canonical_asins,
-                write_pending_transfer)
+                write_pending_transfer, save_progress, get_all_progress)
 from auth import (register, login, logout, get_user_by_token,
                   login_required, admin_required)
 from tasks import job_manager, POOL_HTML, TRACKING_HTML
@@ -412,6 +412,13 @@ body::before{content:'';position:inset:0;background:rgba(0,0,0,0.25);position:fi
 .brand-name span{color:#0071e3}
 .brand-tagline{font-size:11px;color:#86868b;margin-top:4px;letter-spacing:1.5px;text-transform:uppercase}
 
+/* 右上角官网网址（完整显示，不被截断） */
+.site-url{position:fixed;top:18px;right:22px;z-index:5;font-size:13px;color:#1d1d1f;
+  background:rgba(255,255,255,.72);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
+  padding:7px 15px;border-radius:20px;border:1px solid rgba(0,0,0,.06);
+  letter-spacing:.3px;font-weight:600;white-space:nowrap;box-shadow:0 2px 12px rgba(0,0,0,.10)}
+.site-url span{color:#0071e3}
+
 /* 移动端适配 */
 @media(max-width:480px){
   .wrap{padding:16px}
@@ -420,6 +427,7 @@ body::before{content:'';position:inset:0;background:rgba(0,0,0,0.25);position:fi
   .field input{height:42px;font-size:15px}
 }
 </style></head><body>
+<div class="site-url">www.<span>DuraTech</span>.com</div>
 <div class="wrap">
 <div class="card" id="card">
 
@@ -435,7 +443,7 @@ body::before{content:'';position:inset:0;background:rgba(0,0,0,0.25);position:fi
   <!-- 标题（动态切换） -->
   <div class="title" id="titleArea">
     <h1 id="titleText">登录</h1>
-    <p id="titleSub">登录后使用需求池看板与产品追踪系统</p>
+    <p id="titleSub"></p>
   </div>
 
   <!-- 登录表单 -->
@@ -485,6 +493,14 @@ body::before{content:'';position:inset:0;background:rgba(0,0,0,0.25);position:fi
 const TOKEN_KEY = 'duratech_pool_token';
 let isRegMode = false;
 
+// 写入登录态 cookie（供服务端 / 与 /tracking 直接鉴权跳转）
+function setAuthCookie(token) {
+  document.cookie = 'duratech_pool_token=' + token + '; path=/; max-age=' + (30*24*60*60) + '; SameSite=Lax';
+}
+function clearAuthCookie() {
+  document.cookie = 'duratech_pool_token=; path=/; max-age=0; SameSite=Lax';
+}
+
 // ---- 模式切换（登录 ↔ 注册）----
 function toggleMode() {
   isRegMode = !isRegMode;
@@ -501,7 +517,7 @@ function toggleMode() {
 
     if (isRegMode) {
       t.textContent = '创建账户';
-      s.textContent = '注册后即可使用 DuraTech 看板系统';
+      if (s) s.textContent = '';
       cf.classList.add('show');
       tl.textContent = '已有账户？返回登录 →';
       rm.style.display = 'none';
@@ -512,7 +528,7 @@ function toggleMode() {
       document.getElementById('u').focus();
     } else {
       t.textContent = '登录';
-      s.textContent = '登录后使用需求池看板与产品追踪系统';
+      if (s) s.textContent = '';
       cf.classList.remove('show');
       tl.textContent = '创建你的账户 →';
       rm.style.display = '';
@@ -539,6 +555,7 @@ function doLogin() {
   .then(d => {
     if (!d.ok) { msg.textContent = d.error || '登录失败'; msg.style.opacity = '1'; return; }
     localStorage.setItem(TOKEN_KEY, d.token);
+    setAuthCookie(d.token);
     location.href = '/';
   })
   .catch(e => { msg.textContent = '网络错误，请重试'; msg.style.opacity = '1'; });
@@ -566,6 +583,7 @@ function doRegister() {
   .then(d => {
     if (!d.ok) { msg.textContent = d.error || '注册失败'; msg.style.opacity = '1'; return; }
     localStorage.setItem(TOKEN_KEY, d.token);
+    setAuthCookie(d.token);
     // 提示首个用户为管理员
     if (d.user && d.user.is_admin) {
       alert('✅ 注册成功！你是本系统的管理员账户。');
@@ -596,21 +614,66 @@ document.addEventListener('keydown', function(e) {
 
 @app.route("/login")
 def page_login():
+    # 已登录（cookie 有效）则直接进看板
+    user = _current_user()
+    if user:
+        return redirect("/")
     return Response(LOGIN_PAGE, mimetype="text/html")
+
+
+def _current_user():
+    """从 cookie 或 Authorization 头解析当前登录用户，未登录返回 None。
+    cookie 由前端登录成功后写入（duratech_pool_token），用于服务端直接鉴权。"""
+    token = request.cookies.get("duratech_pool_token") or ""
+    if not token:
+        token = request.headers.get("Authorization", "").replace("Bearer ", "").strip()
+    if not token:
+        return None
+    return get_user_by_token(token)
 
 
 @app.route("/")
 def index():
-    token = request.headers.get("Authorization", "").replace("Bearer ", "").strip()
-    if not token:
-        # 页面 HTML 无需服务端鉴权（前端自行判断 401 跳登录），直接返回
-        pass
+    # 未登录 → 跳登录页（满足「访问根路径先到登录页」）
+    user = _current_user()
+    if not user:
+        return redirect("/login")
     return Response(_get_pool_html(), mimetype="text/html")
 
 
 @app.route("/tracking")
 def tracking():
+    user = _current_user()
+    if not user:
+        return redirect("/login")
     return Response(_get_tracking_html(), mimetype="text/html")
+
+
+@app.route("/api/tracking/edits", methods=["GET"])
+@login_required
+def api_tracking_edits_get():
+    """拉取服务端持久化的追踪看板编辑（进度/备注/排序）"""
+    return jsonify({"ok": True, "edits": get_all_progress()})
+
+
+@app.route("/api/tracking/edits", methods=["POST"])
+@login_required
+def api_tracking_edits_post():
+    """批量保存追踪看板编辑（进度/备注/排序）到服务端，实现自动持久化。"""
+    data = request.get_json(force=True, silent=True) or {}
+    edits = data.get("edits", {})
+    updates = []
+    for asin, e in edits.items():
+        if not asin or not isinstance(e, dict):
+            continue
+        updates.append({
+            "asin": asin,
+            "stage": e.get("progress"),
+            "note": e.get("subcategory"),
+            "order": e.get("order"),
+        })
+    n = save_progress(updates)
+    return jsonify({"ok": True, "saved": n})
 
 
 @app.route("/api/health")

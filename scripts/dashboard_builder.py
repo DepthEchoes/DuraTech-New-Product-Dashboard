@@ -275,6 +275,11 @@ body {{ font-family: "Microsoft YaHei", "微软雅黑", Arial, sans-serif; font-
 .header .sub {{ font-size: 12px; opacity: 0.8; }}
 .header .nav-link {{ color: rgba(255,255,255,.8); text-decoration: none; font-size: 13px; margin-left: 16px; transition: color .15s; white-space: nowrap; }}
 .header .nav-link:hover {{ color: #fff; }}
+/* 看板切换导航（需求池 / 产品追踪） */
+.topnav {{ display: flex; gap: 10px; padding: 0 24px; background: linear-gradient(135deg, #16314f, #24447e); }}
+.nav-tab {{ display: inline-flex; align-items: center; gap: 6px; padding: 11px 22px; color: rgba(255,255,255,.7); text-decoration: none; font-size: 14px; font-weight: 600; border-bottom: 3px solid transparent; transition: all .15s; white-space: nowrap; }}
+.nav-tab:hover {{ color: #fff; text-decoration: none; }}
+.nav-tab.active {{ color: #fff; background: rgba(255,255,255,.10); border-bottom-color: #4da3ff; }}
 .header h1 {{ font-size: 20px; margin-bottom: 4px; }}
 .header .sub {{ font-size: 12px; opacity: 0.8; }}
 .stats-row {{ display: grid; grid-template-columns: repeat(8, 1fr); gap: 12px; padding: 16px 24px; }}
@@ -397,8 +402,13 @@ a:hover {{ text-decoration: underline; }}
 <div class="header">
   <div class="header-left">
     <h1>📊 DuraTech 产品追踪看板</h1>
-    <div class="sub">更新于 {date_str} · 新品 {new_count} 个 · 爆品 {hot_count} 个 · 进行中 {active_count} 个 · 已合作 {cooperated_count} 个 · 放弃 {abandoned_count} 个 <a href="/" class="nav-link">📋 返回需求池 →</a></div>
+    <div class="sub">更新于 {date_str} · 新品 {new_count} 个 · 爆品 {hot_count} 个 · 进行中 {active_count} 个 · 已合作 {cooperated_count} 个 · 放弃 {abandoned_count} 个</div>
   </div>
+</div>
+
+<div class="topnav">
+  <a href="/" class="nav-tab">📋 需求池看板 →</a>
+  <a href="/tracking" class="nav-tab active">📊 产品追踪看板</a>
 </div>
 
 <div class="stats-row" id="statsRow">
@@ -576,6 +586,51 @@ const STORAGE_PROGRESS = 'duratech_product_progress';
 const STORAGE_ORDER = 'duratech_product_order';
 const STORAGE_SUBCATEGORY = 'duratech_product_subcategory';
 
+// ===== 服务端自动保存（编辑后回写数据库，跨设备/浏览器持久化）=====
+const TOKEN_KEY = 'duratech_pool_token';
+function getTok() {{ return localStorage.getItem(TOKEN_KEY) || ''; }}
+let _autosaveReady = false;
+let _autosaveTimer = null;
+function autosave() {{
+  if (!_autosaveReady) return;
+  if (_autosaveTimer) clearTimeout(_autosaveTimer);
+  _autosaveTimer = setTimeout(doAutosave, 800);
+}}
+function doAutosave() {{
+  const edits = {{}};
+  PRODUCTS.forEach(function(p, i) {{
+    edits[p.asin] = {{ progress: p._progress, subcategory: p._subcategory || '', order: i }};
+  }});
+  const t = getTok();
+  fetch('/api/tracking/edits', {{
+    method: 'POST',
+    headers: {{ 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + t }},
+    body: JSON.stringify({{ edits: edits }})
+  }}).catch(function() {{}});
+}}
+async function loadServerEdits() {{
+  try {{
+    const t = getTok();
+    const r = await fetch('/api/tracking/edits', {{ headers: {{ 'Authorization': 'Bearer ' + t }} }});
+    if (!r.ok) return;
+    const d = await r.json();
+    const edits = (d && d.edits) || {{}};
+    PRODUCTS.sort(function(a, b) {{
+      const oa = edits[a.asin] ? (edits[a.asin].order || 0) : 99999;
+      const ob = edits[b.asin] ? (edits[b.asin].order || 0) : 99999;
+      if (oa !== ob) return oa - ob;
+      return (a.asin || '').localeCompare(b.asin || '');
+    }});
+    PRODUCTS.forEach(function(p) {{
+      const e = edits[p.asin];
+      if (e) {{
+        if (e.progress) p._progress = e.progress;
+        if (e.subcategory !== undefined) p._subcategory = e.subcategory;
+      }}
+    }});
+  }} catch (e) {{}}
+}}
+
 // ===== 排序持久化 =====
 function loadOrder() {{
   try {{
@@ -595,6 +650,7 @@ function loadOrder() {{
 function saveOrder() {{
   const order = PRODUCTS.map(p => p.asin);
   localStorage.setItem(STORAGE_ORDER, JSON.stringify(order));
+  autosave();
 }}
 
 // ===== 进度持久化 =====
@@ -613,6 +669,7 @@ function saveProgress() {{
   const data = {{}};
   PRODUCTS.forEach(p => {{ data[p.asin] = p._progress; }});
   localStorage.setItem(STORAGE_PROGRESS, JSON.stringify(data));
+  autosave();
 }}
 
 // ===== 进度列持久化（手动输入，原品类列） =====
@@ -629,6 +686,7 @@ function saveSubcategories() {{
   const data = {{}};
   PRODUCTS.forEach(p => {{ if (p._subcategory) data[p.asin] = p._subcategory; }});
   localStorage.setItem(STORAGE_SUBCATEGORY, JSON.stringify(data));
+  autosave();
 }}
 
 // HTML 转义（用于 textarea 内容 / title 属性）
@@ -1235,11 +1293,15 @@ function showToast(msg) {{
 }}
 
 // ===== 初始化 =====
-loadProgress();
-loadOrder();
-loadSubcategories();
-renderAll();
-renderCharts();
+(async function initBoard() {{
+  loadProgress();
+  loadOrder();
+  loadSubcategories();
+  await loadServerEdits();   // 服务端持久化编辑覆盖本地 localStorage
+  _autosaveReady = true;
+  renderAll();
+  renderCharts();
+}})();
 </script>
 </body>
 </html>"""

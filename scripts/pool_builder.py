@@ -70,6 +70,8 @@ WEB_SCRIPT_EXTRA = """
 // ============ 在线版：登录态 ============
 const TOKEN_KEY = 'duratech_pool_token';
 function getToken() { return localStorage.getItem(TOKEN_KEY) || ''; }
+function setAuthCookie(token) { document.cookie = 'duratech_pool_token=' + token + '; path=/; max-age=' + (30*24*60*60) + '; SameSite=Lax'; }
+function clearAuthCookie() { document.cookie = 'duratech_pool_token=; path=/; max-age=0; SameSite=Lax'; }
 async function api(url, opts) {
   opts = opts || {};
   opts.headers = Object.assign({ 'Content-Type': 'application/json' }, opts.headers || {});
@@ -105,7 +107,7 @@ async function doLogin() {
   if (!u || !p) { msg.textContent = '请输入用户名和密码'; return; }
   try {
     const d = await api('/api/auth/login', { method: 'POST', body: JSON.stringify({ username: u, password: p }) });
-    localStorage.setItem(TOKEN_KEY, d.token); showUser(d.user); msg.textContent = '';
+    localStorage.setItem(TOKEN_KEY, d.token); setAuthCookie(d.token); showUser(d.user); msg.textContent = '';
     showToast('✅ 登录成功'); loadPool();
   } catch (e) { msg.textContent = e.message; }
 }
@@ -116,12 +118,14 @@ async function doRegister() {
   if (!u || !p) { msg.textContent = '请输入用户名和密码'; return; }
   try {
     const d = await api('/api/auth/register', { method: 'POST', body: JSON.stringify({ username: u, password: p }) });
-    localStorage.setItem(TOKEN_KEY, d.token); showUser(d.user); msg.textContent = '';
+    localStorage.setItem(TOKEN_KEY, d.token); setAuthCookie(d.token); showUser(d.user); msg.textContent = '';
     showToast('✅ 注册成功（首个用户为管理员）'); loadPool();
   } catch (e) { msg.textContent = e.message; }
 }
 function doLogout() {
-  localStorage.removeItem(TOKEN_KEY); showLogin(); showToast('已退出登录');
+  const t = getToken();
+  if (t) { fetch('/api/auth/logout', { method: 'POST', headers: { 'Authorization': 'Bearer ' + t } }).catch(() => {}); }
+  localStorage.removeItem(TOKEN_KEY); clearAuthCookie(); showLogin(); showToast('已退出登录');
 }
 
 // ============ 在线版：Cookie 上传 + 采集 ============
@@ -315,6 +319,11 @@ body {{ font-family: "Microsoft YaHei", "微软雅黑", Arial, sans-serif; font-
 .header .sub {{ font-size: 12px; opacity: 0.8; }}
 .header .nav-link {{ color: rgba(255,255,255,.8); text-decoration: none; font-size: 13px; margin-left: 16px; transition: color .15s; white-space: nowrap; }}
 .header .nav-link:hover {{ color: #fff; }}
+/* 看板切换导航（需求池 / 产品追踪） */
+.topnav {{ display: flex; gap: 10px; padding: 0 24px; background: linear-gradient(135deg, #16314f, #24447e); }}
+.nav-tab {{ display: inline-flex; align-items: center; gap: 6px; padding: 11px 22px; color: rgba(255,255,255,.7); text-decoration: none; font-size: 14px; font-weight: 600; border-bottom: 3px solid transparent; transition: all .15s; white-space: nowrap; }}
+.nav-tab:hover {{ color: #fff; text-decoration: none; }}
+.nav-tab.active {{ color: #fff; background: rgba(255,255,255,.10); border-bottom-color: #4da3ff; }}
 /* Tab 切换 */
 .tabs {{ display: flex; margin: 16px 24px 0; gap: 0; }}
 .tab-btn {{ padding: 10px 28px; border: none; background: #e9ecef; cursor: pointer; font-size: 14px; font-family: inherit; border-radius: 8px 8px 0 0; font-weight: bold; color: #666; }}
@@ -363,9 +372,14 @@ a:hover {{ text-decoration: underline; }}
 <div class="header">
   <div class="header-left">
     <h1>📋 DuraTech 需求池看板</h1>
-    <div class="sub">周次: {week_label} · 生成于 {date_str} · 勾选产品后可转入追踪看板 <a href="/tracking" class="nav-link">📊 追踪看板 →</a></div>
+    <div class="sub">周次: {week_label} · 生成于 {date_str} · 勾选产品后可转入追踪看板</div>
   </div>
   <div id="headerRightArea"></div>
+</div>
+
+<div class="topnav">
+  <a href="/" class="nav-tab active">📋 需求池看板</a>
+  <a href="/tracking" class="nav-tab">📊 产品追踪看板 →</a>
 </div>
 
 {header_extra}

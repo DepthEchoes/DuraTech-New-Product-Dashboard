@@ -172,6 +172,23 @@ def save_progress(updates):
     return n
 
 
+def get_all_progress():
+    """返回全量进度/备注/排序，结构 {asin: {progress, subcategory, order}}。
+    供追踪看板前端初始化时拉取服务端持久化的最新编辑（db 为权威源）。"""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT asin, stage, note, order_index FROM progress").fetchall()
+    conn.close()
+    out = {}
+    for r in rows:
+        out[r["asin"]] = {
+            "progress": r["stage"],
+            "subcategory": r["note"] or "",
+            "order": r["order_index"] or 0,
+        }
+    return out
+
+
 def compute_stats(products):
     by_progress = Counter(p.get("_progress", "待调研") for p in products)
     total = len(products)
