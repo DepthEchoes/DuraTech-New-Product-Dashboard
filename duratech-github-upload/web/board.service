@@ -1,0 +1,24 @@
+# systemd 服务文件 - DuraTech 需求池看板在线版
+# 由 deploy/setup_server.sh 在部署时自动生成到 /etc/systemd/system/poolboard.service
+# （下方为参考模板，SECRET_KEY 与 venv 路径由脚本注入）
+#
+# 手动部署时:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now poolboard
+# 注意: 生产必须"单进程多线程"（-w 单 worker + --threads），否则采集任务状态无法共享
+
+[Unit]
+Description=DuraTech Demand Pool Board (Web)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/workspace/sellersprite-automation/web
+ExecStart=/workspace/sellersprite-automation/venv/bin/python -m waitress --host=127.0.0.1 --port=58901 --threads=8 pool_server:app
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+Environment=SECRET_KEY=由部署脚本自动注入随机值
+
+[Install]
+WantedBy=multi-user.target
