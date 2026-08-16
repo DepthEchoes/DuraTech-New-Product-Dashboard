@@ -371,7 +371,8 @@ LOGIN_PAGE = r"""<!DOCTYPE html>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","Segoe UI","Microsoft YaHei",sans-serif;
-  background:url('/static/bg-login.jpg') center/cover no-repeat fixed;
+  background:url('/static/bg-login.jpg') center/contain no-repeat fixed;
+  background-color:#11131f;
   min-height:100vh;display:flex;align-items:center;justify-content:center;
   position:relative}
 body::before{content:'';position:inset:0;background:rgba(0,0,0,0.25);position:fixed;z-index:0}
@@ -382,9 +383,9 @@ body::before{content:'';position:inset:0;background:rgba(0,0,0,0.25);position:fi
   border-radius:18px;padding:44px 40px 36px;box-shadow:0 8px 40px rgba(0,0,0,0.18),0 2px 8px rgba(0,0,0,0.08);
   transition:all .35s ease}
 
-/* 标题 */
-.title{text-align:center;margin-bottom:32px}
-.title h1{font-size:22px;font-weight:600;color:#1d1d1f;letter-spacing:.3px}
+/* 标题（放大居中） */
+.title{text-align:center;margin-bottom:28px;margin-top:6px}
+.title h1{font-size:32px;font-weight:700;color:#1d1d1f;letter-spacing:.5px}
 .title p{font-size:13px;color:#86868b;margin-top:6px}
 
 /* 输入框 - Apple 风格 */
@@ -436,45 +437,18 @@ body::before{content:'';position:inset:0;background:rgba(0,0,0,0.25);position:fi
 /* 模式切换动画 */
 .card.switching{opacity:0;transform:translateY(8px)}
 
-/* DuraTech Logo 区域 */
-.brand{text-align:center;margin-bottom:28px}
-.brand-logo{display:inline-flex;align-items:center;gap:10px}
-.brand-icon{width:36px;height:36px;border-radius:9px;background:linear-gradient(135deg,#00a8cc,#0071e3);
-  display:flex;align-items:center;justify-content:center;color:#fff;font-weight:800;font-size:16px;
-  box-shadow:0 2px 8px rgba(0,113,227,.3)}
-.brand-name{font-size:20px;font-weight:700;color:#1d1d1f;letter-spacing:.5px}
-.brand-name span{color:#0071e3}
-.brand-tagline{font-size:11px;color:#86868b;margin-top:4px;letter-spacing:1.5px;text-transform:uppercase}
-
-/* 右上角官网网址（完整显示，不被截断） */
-.site-url{position:fixed;top:18px;right:22px;z-index:5;font-size:13px;color:#1d1d1f;
-  background:rgba(255,255,255,.72);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
-  padding:7px 15px;border-radius:20px;border:1px solid rgba(0,0,0,.06);
-  letter-spacing:.3px;font-weight:600;white-space:nowrap;box-shadow:0 2px 12px rgba(0,0,0,.10)}
-.site-url span{color:#0071e3}
-
 /* 移动端适配 */
 @media(max-width:480px){
   .wrap{padding:16px}
   .card{padding:32px 24px 28px;border-radius:14px}
-  .title h1{font-size:19px}
+  .title h1{font-size:26px}
   .field input{height:42px;font-size:15px}
 }
 </style></head><body>
-<div class="site-url">www.<span>DuraTech</span>.com</div>
 <div class="wrap">
 <div class="card" id="card">
 
-  <!-- 品牌 -->
-  <div class="brand">
-    <div class="brand-logo"><div style="font-family:Arial">D</div></div>
-    <div>
-      <div class="brand-name">Dura<span>Tech</span></div>
-      <div class="brand-tagline">Built to Last</div>
-    </div>
-  </div>
-
-  <!-- 标题（动态切换） -->
+  <!-- 标题（放大居中，动态切换） -->
   <div class="title" id="titleArea">
     <h1 id="titleText">登录</h1>
     <p id="titleSub"></p>
