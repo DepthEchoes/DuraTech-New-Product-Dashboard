@@ -10,9 +10,10 @@ import os
 import secrets
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
-from flask import Flask, request, jsonify, Response, redirect, send_from_directory
+from flask import Flask, request, jsonify, Response, redirect, send_from_directory, g
 
 WEB_DIR = Path(__file__).parent
 SCRIPT_DIR = Path(__file__).parent.parent / "scripts"
@@ -20,11 +21,15 @@ sys.path.insert(0, str(WEB_DIR))
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from db import (init_db, load_latest_pool, load_canonical_asins,
-                write_pending_transfer, save_progress, get_all_progress)
+                write_pending_transfer, save_progress, get_all_progress,
+                is_locked, record_fail, reset_fail, MAX_FAILS, LOCK_MINUTES,
+                load_transferred, save_transferred, upsert_transferred)
 from auth import (register, login, logout, get_user_by_token,
-                  login_required, admin_required, change_password)
+                  login_required, admin_required, change_password, TOKEN_TTL_DAYS)
 from werkzeug.security import check_password_hash
-from tasks import job_manager, POOL_HTML, TRACKING_HTML
+from tasks import (job_manager, POOL_HTML, TRACKING_HTML,
+                   ACTIVE_STAGES, product_from_lookup,
+                   apply_lookup_to_product)
 from config import SESSIONS_DIR
 
 app = Flask(__name__)
@@ -78,6 +83,26 @@ def _rebuild_all_html():
 # ============================================================
 # 账号系统
 # ============================================================
+# Cookie 安全下发：HttpOnly + SameSite=Lax 始终开启；Secure 仅在 HTTPS 时开启。
+# 当前服务器为 HTTP（无 HTTPS），Secure 必须为 False，否则浏览器拒收 cookie 导致登录失效。
+def _secure_cookie_flag():
+    # 通过 X-Forwarded-Proto / 请求 scheme 判断是否走 HTTPS
+    proto = request.headers.get("X-Forwarded-Proto", "") or request.scheme
+    return proto.lower() == "https"
+
+
+def _set_auth_cookie(resp, token, expires):
+    max_age = int((expires - datetime.now()).total_seconds()) if expires else TOKEN_TTL_DAYS * 86400
+    resp.set_cookie(
+        "duratech_pool_token", token,
+        httponly=True,
+        samesite="Lax",
+        secure=_secure_cookie_flag(),
+        max_age=max_age,
+        path="/",
+    )
+
+
 @app.route("/api/auth/register", methods=["POST"])
 def api_register():
     data = request.get_json(force=True, silent=True) or {}
@@ -87,17 +112,33 @@ def api_register():
     token, expires = None, None
     # 注册后自动登录
     user2, token, expires = login(user["username"], data.get("password", ""))
-    return jsonify({"ok": True, "token": token, "expires": expires.isoformat() if expires else None,
+    resp = jsonify({"ok": True, "token": token, "expires": expires.isoformat() if expires else None,
                     "user": user2})
+    _set_auth_cookie(resp, token, expires)
+    return resp
 
 
 @app.route("/api/auth/login", methods=["POST"])
 def api_login():
     data = request.get_json(force=True, silent=True) or {}
-    user, token, expires = login(data.get("username", ""), data.get("password", ""))
+    uname = (data.get("username", "") or "").strip()
+    # 暴力破解防护：先查锁定状态（防锁定期内反复尝试）
+    if is_locked(uname):
+        return jsonify({"ok": False, "error": f"账号已锁定，请 {LOCK_MINUTES} 分钟后再试"}), 423
+    user, token, expires = login(uname, data.get("password", ""))
     if not user:
-        return jsonify({"ok": False, "error": "用户名或密码错误"}), 401
-    return jsonify({"ok": True, "token": token, "expires": expires.isoformat(), "user": user})
+        fails = record_fail(uname)
+        remain = max(0, MAX_FAILS - fails)
+        msg = "用户名或密码错误"
+        if fails >= MAX_FAILS:
+            msg = f"失败次数过多，账号已锁定 {LOCK_MINUTES} 分钟"
+        elif remain > 0:
+            msg = f"用户名或密码错误，还可尝试 {remain} 次"
+        return jsonify({"ok": False, "error": msg}), 401
+    reset_fail(uname)  # 登录成功清零
+    resp = jsonify({"ok": True, "token": token, "expires": expires.isoformat(), "user": user})
+    _set_auth_cookie(resp, token, expires)
+    return resp
 
 
 @app.route("/api/auth/logout", methods=["POST"])
@@ -105,7 +146,9 @@ def api_login():
 def api_logout():
     from flask import g
     logout(g.token)
-    return jsonify({"ok": True})
+    resp = jsonify({"ok": True})
+    resp.delete_cookie("duratech_pool_token", path="/")
+    return resp
 
 
 @app.route("/api/auth/me", methods=["GET"])
@@ -243,7 +286,31 @@ def api_cookie():
     except Exception:
         pass
 
-    # 自动触发采集
+    # 自动触发任务（task 决定动作；默认 collect 兼容需求池页面上传按钮）
+    #   collect        需求池采集（pool.html 上传）
+    #   lookup_update  查竞品批量更新产品信息（tracking 页「产品信息更新」）
+    #   lookup_add     查竞品抓单 ASIN 后加入追踪看板（tracking 页「添加 ASIN」）
+    task = (request.form.get("task") or "collect").strip()
+    if task == "lookup_update":
+        started = job_manager.start("lookup_update")
+        if not started:
+            return jsonify({"ok": False, "error": "已有任务在运行，请稍候再试",
+                            "running": True}), 409
+        return jsonify({"ok": True, "task_type": "lookup_update",
+                        "cookies": len(cookies),
+                        "message": "Cookie 已保存，开始批量更新产品信息"})
+    if task == "lookup_add":
+        asin = (request.form.get("asin") or "").strip().upper()
+        if not _re.fullmatch(r"[A-Z0-9]{8,12}", asin):
+            return jsonify({"ok": False, "error": "ASIN 格式不正确"}), 400
+        started = job_manager.start("lookup_add", asin=asin)
+        if not started:
+            return jsonify({"ok": False, "error": "已有任务在运行，请稍候再试",
+                            "running": True}), 409
+        return jsonify({"ok": True, "task_type": "lookup_add", "asin": asin,
+                        "cookies": len(cookies),
+                        "message": "Cookie 已保存，开始获取产品信息"})
+
     max_pages = request.form.get("max_pages", "20")
     try:
         max_pages = max(1, min(50, int(max_pages)))
@@ -253,9 +320,66 @@ def api_cookie():
     if not started:
         return jsonify({"ok": False, "error": "已有采集任务在运行", "running": True}), 409
 
-    return jsonify({"ok": True, "task_started": True,
+    return jsonify({"ok": True, "task_type": "collect", "task_started": True,
                     "cookies": len(cookies),
                     "message": f"Cookie 已保存（{len(cookies)} 条），采集已自动开始"})
+
+
+# ============================================================
+# Cookie 有效性检测 / 直接启动追踪任务（不重新上传 Cookie）
+# ============================================================
+def _check_sellersprite_cookie():
+    """检测当前 sessions/cookies.json 是否仍有效（未过期）。
+
+    用卖家精灵 /v2/me 轻量接口：200=有效；302 到登录页=过期。
+    """
+    try:
+        import competitor_lookup as cl
+        s = cl._session()
+        r = s.get("https://www.sellersprite.com/v2/me",
+                  headers=cl.HEADERS, timeout=15, allow_redirects=False)
+        return r.status_code == 200 and len(r.text) > 0
+    except Exception:
+        return False
+
+
+@app.route("/api/cookie/check", methods=["GET"])
+@login_required
+def api_cookie_check():
+    """检测卖家精灵 Cookie 是否有效。返回 {valid: true/false}"""
+    return jsonify({"ok": True, "valid": _check_sellersprite_cookie()})
+
+
+@app.route("/api/tracking/update/start", methods=["POST"])
+@login_required
+def api_tracking_update_start():
+    """Cookie 有效时直接启动「产品信息更新」异步任务（不上传 Cookie）"""
+    started = job_manager.start("lookup_update")
+    if not started:
+        return jsonify({"ok": False, "error": "已有任务在运行，请稍候再试",
+                        "running": True}), 409
+    return jsonify({"ok": True, "task_type": "lookup_update",
+                    "message": "产品信息更新已开始"})
+
+
+@app.route("/api/tracking/add/start", methods=["POST"])
+@login_required
+def api_tracking_add_start():
+    """Cookie 有效时直接启动「添加 ASIN」异步任务（不上传 Cookie）"""
+    data = request.get_json(force=True, silent=True) or {}
+    raw = (data.get("asin") or "").strip()
+    asin = raw.upper()
+    if not _re.fullmatch(r"[A-Z0-9]{8,12}", asin):
+        return jsonify({"ok": False, "error": "ASIN 格式不正确"}), 400
+    if asin in load_canonical_asins():
+        return jsonify({"ok": False,
+                        "error": f"ASIN {asin} 已在追踪看板中，无需重复添加"})
+    started = job_manager.start("lookup_add", asin=asin)
+    if not started:
+        return jsonify({"ok": False, "error": "已有任务在运行，请稍候再试",
+                        "running": True}), 409
+    return jsonify({"ok": True, "task_type": "lookup_add", "asin": asin,
+                    "message": f"已开始添加 {asin}"})
 
 
 # ============================================================
@@ -264,7 +388,9 @@ def api_cookie():
 @app.route("/api/collection/status", methods=["GET"])
 @login_required
 def api_collection_status():
-    return jsonify(job_manager.snapshot())
+    # 必须带 ok:True，否则前端 api() 助手会判定为失败并抛错，
+    # 导致 renderStatus 永不执行、进度弹窗卡在初始「准备中…/0%」。
+    return jsonify({"ok": True, **job_manager.snapshot()})
 
 
 @app.route("/api/collection/start", methods=["POST"])
@@ -288,7 +414,18 @@ def api_pool():
     new_pool = load_latest_pool("new")
     hot_pool = load_latest_pool("hot")
     week = (new_pool or hot_pool or {}).get("week", "")
+
+    # 已转入追踪看板的产品自动标记 _imported（前端禁用勾选，实现「转入自动移除」）
+    imported = load_canonical_asins()
+    for pool_data in (new_pool, hot_pool):
+        if not pool_data:
+            continue
+        for p in pool_data.get("products", []):
+            if p.get("asin") in imported:
+                p["_imported"] = True
+
     return jsonify({
+        "ok": True,
         "week": week,
         "new": {"stats": (new_pool or {}).get("stats", {}),
                 "products": (new_pool or {}).get("products", [])},
@@ -334,6 +471,13 @@ def api_pool_import():
         p.setdefault("_source", pool)
 
     existing = load_canonical_asins()
+    # 已转入的产品自动移除（不再重复转入）
+    selected = [p for p in selected if p.get("asin") not in existing]
+    if not selected:
+        return jsonify({"ok": True, "selected": 0, "added": 0,
+                        "skipped": len(asins),
+                        "message": "所选产品均已转入追踪看板，无需重复导入"})
+
     skipped = sum(1 for p in selected if p.get("asin") in existing)
     added = len(selected) - skipped
 
@@ -360,6 +504,39 @@ STATIC_DIR = WEB_DIR / "static"
 def serve_static(filename):
     """托管 web/static/ 下的静态文件（图片/CSS/JS）"""
     return send_from_directory(str(STATIC_DIR), filename)
+
+
+# ============================================================
+# 全局鉴权拦截（before_request）
+# 未登录访问任何非白名单路径，页面跳 /login，API 返回 401。
+# 这是需求 1（访问根路径未登录跳登录页）的正规化实现，覆盖所有页面与 API。
+# ============================================================
+def _is_whitelisted(path):
+    """白名单：登录页、静态资源、认证类 API、健康检查——必须匿名可访问"""
+    if path in ("/login", "/api/health"):
+        return True
+    if path.startswith("/static/"):
+        return True
+    # 认证 API：登录/注册/登出 允许匿名；/api/auth/me 需登录，不放行
+    if path.startswith("/api/auth/"):
+        return path in ("/api/auth/login", "/api/auth/register", "/api/auth/logout")
+    return False
+
+
+@app.before_request
+def _guard():
+    p = request.path
+    # 登录页自身 / 静态 / 认证 API / 健康检查：直接放行，避免死循环
+    if _is_whitelisted(p):
+        return None
+    user = _current_user()  # 复用 cookie+header 双来源判定
+    if user:
+        g.user = user
+        return None
+    # 未登录：API 返回 401，页面跳登录页
+    if p.startswith("/api/"):
+        return jsonify({"ok": False, "error": "未登录或登录已过期"}), 401
+    return redirect("/login")
 
 
 # ============================================================
@@ -459,10 +636,7 @@ body::before{content:'';position:inset:0;background:rgba(0,0,0,0.25);position:fi
     <div id="msg"></div>
 
     <div class="field">
-      <input id="u" type="text" placeholder="用户名" autocomplete="username" autofocus>
-      <button type="button" class="arrow" onclick="doLogin()" aria-label="继续">
-        <svg viewBox="0 0 24 24"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
-      </button>
+      <input id="u" type="text" placeholder="用户名" autocomplete="username" autofocus style="padding-right:16px">
     </div>
 
     <div class="field pw-mode">
@@ -489,8 +663,8 @@ body::before{content:'';position:inset:0;background:rgba(0,0,0,0.25);position:fi
     </label>
   </form>
 
-  <!-- 底部链接 -->
-  <div class="links" id="linksArea">
+  <!-- 底部链接（注册入口已隐藏） -->
+  <div class="links" id="linksArea" style="display:none">
     <a href="#" id="toggleLink" onclick="toggleMode()">创建你的账户 →</a>
   </div>
 
@@ -622,7 +796,7 @@ document.addEventListener('keydown', function(e) {
 
 @app.route("/login")
 def page_login():
-    # 已登录（cookie 有效）则直接进看板
+    # 全局 before_request 已保证未登录会跳到此处；已登录则直接进看板
     user = _current_user()
     if user:
         return redirect("/")
@@ -642,18 +816,11 @@ def _current_user():
 
 @app.route("/")
 def index():
-    # 未登录 → 跳登录页（满足「访问根路径先到登录页」）
-    user = _current_user()
-    if not user:
-        return redirect("/login")
     return Response(_get_pool_html(), mimetype="text/html")
 
 
 @app.route("/tracking")
 def tracking():
-    user = _current_user()
-    if not user:
-        return redirect("/login")
     return Response(_get_tracking_html(), mimetype="text/html")
 
 
@@ -667,7 +834,7 @@ def api_tracking_edits_get():
 @app.route("/api/tracking/edits", methods=["POST"])
 @login_required
 def api_tracking_edits_post():
-    """批量保存追踪看板编辑（进度/备注/排序）到服务端，实现自动持久化。"""
+    """批量保存追踪看板编辑（进度/备注/追踪人/排序）到服务端，实现自动持久化。"""
     data = request.get_json(force=True, silent=True) or {}
     edits = data.get("edits", {})
     updates = []
@@ -678,10 +845,227 @@ def api_tracking_edits_post():
             "asin": asin,
             "stage": e.get("progress"),
             "note": e.get("subcategory"),
+            "tracker": e.get("tracker"),
             "order": e.get("order"),
         })
     n = save_progress(updates)
     return jsonify({"ok": True, "saved": n})
+
+
+# ============================================================
+# 手动添加 ASIN / 查竞品批量更新（任务3 + 任务2）
+# 浏览器 UI 走 /api/cookie（task=lookup_update|lookup_add）+ 进度轮询；
+# 下方 POST 同步接口保留给后端脚本 / curl 快速调用与回归测试。
+# ============================================================
+import re as _re
+
+
+def _tracking_rebuild():
+    """串行重建追踪看板 HTML"""
+    with job_manager.import_lock:
+        import dashboard_builder
+        dashboard_builder.build_dashboard(output_path=TRACKING_HTML)
+
+
+def _product_from_lookup_removed():
+    """(移除) 产品构造/更新 helpers 已迁至 tasks.py：
+    product_from_lookup / apply_lookup_to_product / _fmt_price / _fmt_thousands"""
+    pass
+
+
+# ---- 产品构造 / 字段更新 helpers 已统一迁移至 tasks.py（product_from_lookup /
+#      apply_lookup_to_product / _fmt_price / _fmt_thousands），本文件从 tasks 导入。
+
+
+# ============================================================
+# 市场分析附件（上传 / 列表 / 预览）
+# ============================================================
+from db import OUTPUT_DIR as _OUTPUT_DIR
+
+ATTACH_DIR = Path(_OUTPUT_DIR) / "attachments"
+ATTACH_ALLOWED_EXT = {".html", ".htm", ".xlsx", ".xls"}
+
+
+@app.route("/api/market/upload", methods=["POST"])
+@login_required
+def api_market_upload():
+    """上传市场分析附件到 output/attachments/{asin}/，支持多文件。"""
+    asin = (request.form.get("asin") or "").strip().upper()
+    if not _re.fullmatch(r"[A-Z0-9]{8,12}", asin):
+        return jsonify({"ok": False, "error": "ASIN 格式不正确"}), 400
+    files = request.files.getlist("files") or []
+    f = request.files.get("file")
+    if f:
+        files = [f]
+    if not files:
+        return jsonify({"ok": False, "error": "未收到文件"}), 400
+
+    dest_dir = ATTACH_DIR / asin
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    saved = []
+    for f in files:
+        name = Path(f.filename or "").name
+        ext = Path(name).suffix.lower()
+        if ext not in ATTACH_ALLOWED_EXT:
+            return jsonify({"ok": False,
+                            "error": f"仅支持 HTML/Excel 附件（收到 {ext or '未知'}）"}), 400
+        if not name:
+            continue
+        dest = dest_dir / name
+        f.save(str(dest))
+        saved.append(name)
+    return jsonify({"ok": True, "saved": saved,
+                    "message": f"已上传 {len(saved)} 个附件"})
+
+
+@app.route("/api/market/list", methods=["GET"])
+@login_required
+def api_market_list():
+    """列出某 ASIN 的市场分析附件"""
+    asin = (request.args.get("asin") or "").strip().upper()
+    if not asin:
+        return jsonify({"ok": False, "error": "缺少 ASIN"}), 400
+    d = ATTACH_DIR / asin
+    files = []
+    if d.exists():
+        for fp in sorted(d.iterdir()):
+            if fp.is_file():
+                st = fp.stat()
+                files.append({
+                    "name": fp.name,
+                    "size": st.st_size,
+                    "mtime": datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M"),
+                })
+    return jsonify({"ok": True, "asin": asin, "files": files})
+
+
+@app.route("/api/market/counts", methods=["GET"])
+@login_required
+def api_market_counts():
+    """批量返回多个 ASIN 的市场分析附件数（供排序/渲染后一次性刷新计数）
+
+    query: asins=B0X,B0Y,...  返回 {counts: {ASIN: n}}
+    """
+    raw = request.args.get("asins") or ""
+    asins = [a.strip().upper() for a in raw.split(",") if a.strip()]
+    counts = {}
+    for a in asins:
+        d = ATTACH_DIR / a
+        if d.is_dir():
+            counts[a] = sum(1 for fp in d.iterdir() if fp.is_file())
+        else:
+            counts[a] = 0
+    return jsonify({"ok": True, "counts": counts})
+
+
+@app.route("/api/market/file/<asin>/<path:filename>", methods=["GET"])
+@login_required
+def api_market_file(asin, filename):
+    """预览/下载附件（HTML 新标签打开，Excel 触发浏览器预览/下载）"""
+    d = ATTACH_DIR / asin.upper()
+    return send_from_directory(str(d), filename)
+
+
+@app.route("/api/tracking/exists", methods=["GET"])
+@login_required
+def api_tracking_exists():
+    """查询 ASIN 是否已在追踪看板（手动添加前预检）"""
+    asin = (request.args.get("asin") or "").strip().upper()
+    return jsonify({"ok": True, "asin": asin,
+                    "exists": bool(asin) and asin in load_canonical_asins()})
+
+
+@app.route("/api/tracking/add", methods=["POST"])
+@login_required
+def api_tracking_add():
+    """手动添加 ASIN：查竞品工具抓产品信息 -> 加入追踪看板（待调研）。
+
+    body: {asin}
+    返回 {ok, message, product?, reload}；ASIN 已存在返回 ok=False。
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    raw = (data.get("asin") or "").strip()
+    asin = raw.upper()
+    if not _re.fullmatch(r"[A-Z0-9]{8,12}", asin):
+        return jsonify({"ok": False, "error": "ASIN 格式不正确（应为 8-12 位字母数字）"}), 400
+    if asin in load_canonical_asins():
+        return jsonify({"ok": False,
+                        "error": f"ASIN {asin} 已在追踪看板中，无需重复添加"})
+
+    import competitor_lookup
+    info = competitor_lookup.fetch_product(asin)
+    if "error" in info:
+        return jsonify({"ok": False, "error": info["error"]}), 400
+
+    product = product_from_lookup(asin, info)
+    product, _is_new = upsert_transferred(product)
+    # 进度默认待调研写入 progress 表，与其他产品一致
+    try:
+        save_progress([{"asin": asin, "stage": "待调研", "note": "",
+                        "tracker": "", "order": 0}])
+    except Exception:
+        pass
+    try:
+        _tracking_rebuild()
+    except Exception as e:
+        return jsonify({"ok": False,
+                        "error": f"产品已加入，但看板刷新失败: {e}"}), 500
+
+    title = (product.get("title") or "")[:40]
+    return jsonify({"ok": True,
+                    "message": f"已添加 {asin}（{title}）",
+                    "product": product, "reload": True})
+
+
+@app.route("/api/tracking/refresh", methods=["POST"])
+@login_required
+def api_tracking_refresh():
+    """查竞品批量刷新追踪看板（默认全部进行中产品；也可指定 asins 列表）。
+
+    body: {asins?: [...]}  空/缺省 = 刷新待调研/调研中/已联系/已送样/仍在跟进
+    返回 {ok, refreshed: [...], failed: [...], message}
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    given = data.get("asins") or []
+    products = load_transferred()
+    if not products:
+        return jsonify({"ok": False, "error": "追踪看板暂无产品，请先导入或手动添加"}), 400
+
+    if given:
+        want = {str(a).strip().upper() for a in given if str(a).strip()}
+        targets = [p for p in products if p.get("asin", "").upper() in want]
+    else:
+        targets = [p for p in products
+                   if p.get("_progress", "待调研") in ACTIVE_STAGES]
+    if not targets:
+        return jsonify({"ok": False, "error": "没有需要刷新的产品（已合作/放弃不刷新）"}), 400
+
+    import competitor_lookup
+    asins = [p.get("asin", "") for p in targets if p.get("asin")]
+    fresh, errs = competitor_lookup.fetch_products_batch(asins)
+
+    touched = []
+    for p in targets:
+        info = fresh.get(p.get("asin", "").upper())
+        if not info:
+            continue
+        apply_lookup_to_product(p, info)
+        touched.append(p.get("asin"))
+
+    if touched:
+        # targets 元素即 products 中对象引用，apply_lookup_to_product 已就地更新，直接整体写回
+        save_transferred(products)
+        try:
+            _tracking_rebuild()
+        except Exception as e:
+            return jsonify({"ok": False,
+                            "error": f"数据已更新，但看板刷新失败: {e}"}), 500
+
+    failed = [e for e in errs]
+    msg = (f"✅ 已刷新 {len(touched)} 个产品"
+           + (f"，{len(failed)} 个失败" if failed else ""))
+    return jsonify({"ok": True, "refreshed": touched,
+                    "failed": failed, "message": msg})
 
 
 @app.route("/api/health")

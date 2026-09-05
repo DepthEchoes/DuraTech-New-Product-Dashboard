@@ -37,7 +37,13 @@ def load_raw_products(raw_path):
                 for p in items:
                     asin = p.get("asin", "")
                     if asin:
-                        p["category"] = cat
+                        # 细分类目模式下 key 形如 "一级 > 细分类目"，
+                        # 只在产品没有一级类目时才补（不覆盖 collector 设置的 category）
+                        base_l1 = cat.split(" > ")[0].strip()
+                        if not p.get("category"):
+                            p["category"] = base_l1
+                        if not p.get("category_l1"):
+                            p["category_l1"] = base_l1
                         products[asin] = p
     return products
 
@@ -155,8 +161,63 @@ def diff_and_filter(this_week_products, last_week_products):
     return kept, stats
 
 
+def _parse_date(s):
+    """解析上架时间，返回 date 或 None"""
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(str(s).strip(), fmt).date()
+        except (ValueError, AttributeError):
+            continue
+    return None
+
+
+def days_since(p):
+    d = _parse_date(p.get("available", ""))
+    if d is None:
+        return None
+    return (datetime.now().date() - d).days
+
+
+def parse_int(v):
+    if v is None:
+        return 0
+    try:
+        return int(float(str(v).replace(",", "").replace("+", "").replace("$", "")))
+    except (ValueError, TypeError):
+        return 0
+
+
+def classify_product(p):
+    """按业务规则将单品归入 新品池 / 爆品池 / 无。
+    新品: 上架≤30天 且 近30天销量≥5
+    爆品: 上架≥60天 且 月销售额≥2000（≥5000 为头部爆品）
+    注：30天与60天互斥，保证两池天然不重叠。
+    """
+    ds = days_since(p)
+    sales = parse_sales(p)
+    monthly = parse_int(p.get("monthly_sales"))
+    if ds is not None:
+        if ds <= 30 and sales >= 5:
+            return "new"
+        if ds >= 60 and monthly >= 2000:
+            return "hot"
+        return None
+    # 上架日期缺失：按销量兜底归类
+    if monthly >= 2000:
+        return "hot"
+    if sales >= 5:
+        return "new"
+    return None
+
+
 def run_diff(raw_new_path=None, raw_hot_path=None):
-    """执行周度对比"""
+    """执行周度对比。
+    关键修复：新品池/爆品池不再依赖卖家精灵两次请求(minSales=5 vs 2000)是否
+    真的过滤——很多情况下两次返回相同产品，导致两池变成同一批。改为合并本周
+    new/hot 采集结果后，按产品自身属性(上架时间+销量)归类，保证两池天然不重叠。
+    """
     WEEKLY_DIR.mkdir(parents=True, exist_ok=True)
     date_str = datetime.now().strftime("%Y%m%d")
 
@@ -166,22 +227,33 @@ def run_diff(raw_new_path=None, raw_hot_path=None):
     if raw_hot_path is None:
         raw_hot_path = find_latest_raw("hot")
 
-    if not raw_new_path or not raw_hot_path:
-        print("[ERROR] 找不到采集数据，请先运行 weekly_collect.py")
+    if not raw_new_path and not raw_hot_path:
+        print("[ERROR] 找不到采集数据，请先运行采集")
         return None
 
     print(f"本周新品数据: {raw_new_path}")
     print(f"本周爆品数据: {raw_hot_path}")
 
-    # 加载本周数据
-    this_new = load_raw_products(raw_new_path)
-    this_hot = load_raw_products(raw_hot_path)
-    print(f"本周新品: {len(this_new)} 条, 爆品: {len(this_hot)} 条")
+    # 合并本周 new/hot 采集结果（按 ASIN 去重，取并集）
+    all_products = {}
+    for rp in (raw_new_path, raw_hot_path):
+        if rp:
+            all_products.update(load_raw_products(rp))
+    print(f"本周合并去重后产品: {len(all_products)} 条")
 
-    # 加载上周对比基线
+    # 按属性归类到新品池 / 爆品池候选
+    new_candidates, hot_candidates = {}, {}
+    for asin, p in all_products.items():
+        cls = classify_product(p)
+        if cls == "new":
+            new_candidates[asin] = p
+        elif cls == "hot":
+            hot_candidates[asin] = p
+    print(f"归类 → 新品候选: {len(new_candidates)} 条, 爆品候选: {len(hot_candidates)} 条")
+
+    # 加载上周对比基线（用于周环比去重：仅保留新上架 / 销量增长）
     last_new = find_previous_weekly("new")
     last_hot = find_previous_weekly("hot")
-    # find_previous_weekly 可能返回 dict 或文件路径字符串
     if isinstance(last_new, str):
         last_new = load_raw_products(last_new)
     if isinstance(last_hot, str):
@@ -190,16 +262,23 @@ def run_diff(raw_new_path=None, raw_hot_path=None):
     print(f"上周新品基线: {len(last_new) if last_new else '无(首次运行)'} 条")
     print(f"上周爆品基线: {len(last_hot) if last_hot else '无(首次运行)'} 条")
 
-    # 对比去重
+    # 周环比去重
     print("\n--- 新品池对比 ---")
-    kept_new, stats_new = diff_and_filter(this_new, last_new)
+    kept_new, stats_new = diff_and_filter(new_candidates, last_new)
     print(f"  新上架: {stats_new['new']}, 增长: {stats_new['grew']}, "
           f"跳过(持平): {stats_new['skipped_same']}, 跳过(下降): {stats_new['skipped_decline']}")
 
     print("--- 爆品池对比 ---")
-    kept_hot, stats_hot = diff_and_filter(this_hot, last_hot)
+    kept_hot, stats_hot = diff_and_filter(hot_candidates, last_hot)
     print(f"  新上架: {stats_hot['new']}, 增长: {stats_hot['grew']}, "
           f"跳过(持平): {stats_hot['skipped_same']}, 跳过(下降): {stats_hot['skipped_decline']}")
+
+    # 打标签（前端标签列 / 一键导入依赖）
+    for p in kept_new:
+        p["__label__"] = "潜力新品"
+    for p in kept_hot:
+        monthly = parse_int(p.get("monthly_sales"))
+        p["__label__"] = "头部爆品" if monthly >= 5000 else "标准爆品"
 
     # 保存本周需求池
     # 格式: {"type": "new_pool"/"hot_pool", "products": [...], "week": "20260720", "stats": {...}}

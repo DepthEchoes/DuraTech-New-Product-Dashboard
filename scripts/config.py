@@ -185,6 +185,59 @@ EXPORT_FIELDS = [
 ]
 
 # ============================================================
+# 细分类目筛选配置（需求 A：逐最小细分类目抓取）
+# 仅采集下列 一级类目 -> 目标细分(L2/L3/L4) 组合
+# level 为层级深度；parent_l2 / parent_l3 用于从面包屑还原路径时定位
+# ============================================================
+SUB_CATEGORIES = {
+    "Arts, Crafts & Sewing": [
+        {"name": "Beading & Jewelry Making", "cn": "串珠", "level": 2, "node_id_path": "2617941011:12896081"},
+        {"name": "Crafting", "cn": "工艺", "level": 2, "node_id_path": "2617941011:378733011"},
+    ],
+    "Automotive": [
+        {"name": "Car Care", "cn": "汽车护理", "level": 2, "node_id_path": "15684181:15718271"},
+        {"name": "Interior Accessories", "cn": "内部配件", "level": 2, "node_id_path": "15684181:15857501"},
+        {"name": "Oils & Fluids", "cn": "油类", "level": 2, "node_id_path": "15684181:15718791"},
+        {"name": "RV Parts & Accessories", "cn": "房车配件", "level": 2, "node_id_path": "15684181:2258019011"},
+        {"name": "Tires & Wheels", "cn": "轮胎轮毂", "level": 2, "node_id_path": "15684181:15706571"},
+        {"name": "Tools & Equipment", "cn": "工具", "level": 2, "node_id_path": "15684181:15706941"},
+    ],
+    "Patio, Lawn & Garden": [
+        {"name": "Hand Tools", "cn": "手动园艺工具", "level": 3, "parent_l2": "Gardening & Lawn Care", "node_id_path": "2972638011:3610851:128061011"},
+        {"name": "Plant & Soil Monitoring", "cn": "植物和土壤监测", "level": 3, "parent_l2": "Gardening & Lawn Care", "node_id_path": "2972638011:3610851:23696010011"},
+        {"name": "Watering Equipment", "cn": "浇灌工具", "level": 3, "parent_l2": "Gardening & Lawn Care", "node_id_path": "2972638011:3610851:553958"},
+    ],
+    "Tools & Home Improvement": [
+        {"name": "Measuring & Layout Tools", "cn": "测量", "level": 2, "node_id_path": "228013:553244"},
+        {"name": "Storage & Home Organization", "cn": "储存", "level": 2, "node_id_path": "228013:13400631"},
+        {"name": "Hand Tools", "cn": "手动工具", "level": 3, "parent_l2": "Power & Hand Tools", "node_id_path": "228013:328182011:551238"},
+        {"name": "Tool Organizers", "cn": "工具组织者", "level": 3, "parent_l2": "Power & Hand Tools", "node_id_path": "228013:328182011:13400691"},
+        {"name": "Glue Guns", "cn": "热熔胶枪", "level": 4, "parent_l2": "Power & Hand Tools", "parent_l3": "Power Tools", "node_id_path": "228013:328182011:551236:14138148011"},
+        {"name": "Grinders", "cn": "磨光机", "level": 4, "parent_l2": "Power & Hand Tools", "parent_l3": "Power Tools", "node_id_path": "228013:328182011:551236:552810"},
+        {"name": "Impact Drivers", "cn": "冲击钻", "level": 4, "parent_l2": "Power & Hand Tools", "parent_l3": "Power Tools", "node_id_path": "228013:328182011:551236:2399141011"},
+        {"name": "Impact Wrenches", "cn": "冲击扳手", "level": 4, "parent_l2": "Power & Hand Tools", "parent_l3": "Power Tools", "node_id_path": "228013:328182011:551236:552820"},
+        {"name": "Ratchet Wrenches", "cn": "棘轮扳手", "level": 4, "parent_l2": "Power & Hand Tools", "parent_l3": "Power Tools", "node_id_path": "228013:328182011:551236:9022387011"},
+        {"name": "Rotary Tools", "cn": "旋转工具", "level": 4, "parent_l2": "Power & Hand Tools", "parent_l3": "Power Tools", "node_id_path": "228013:328182011:551236:552862"},
+        {"name": "Saws", "cn": "锯", "level": 4, "parent_l2": "Power & Hand Tools", "parent_l3": "Power Tools", "node_id_path": "228013:328182011:551236:552894"},
+        {"name": "Screw Guns & Screwdrivers", "cn": "螺丝枪", "level": 4, "parent_l2": "Power & Hand Tools", "parent_l3": "Power Tools", "node_id_path": "228013:328182011:551236:9022389011"},
+        {"name": "Shears & Nibblers", "cn": "剪切机", "level": 4, "parent_l2": "Power & Hand Tools", "parent_l3": "Power Tools", "node_id_path": "228013:328182011:551236:552984"},
+    ],
+}
+
+
+def _flatten_subcats():
+    """收集所有目标细分类目英文名（小写），用于采集后快速匹配。"""
+    names = set()
+    for _l1, subs in SUB_CATEGORIES.items():
+        for s in subs:
+            names.add(s["name"].lower())
+    return names
+
+
+TARGET_SUBCATEGORY_NAMES = _flatten_subcats()
+
+
+# ============================================================
 # 采集配置
 # ============================================================
 MAX_PAGES_PER_CATEGORY = 50   # 每个类目最大翻页数

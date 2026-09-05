@@ -22,11 +22,15 @@ def _now():
 
 def register(username, password, is_admin=False):
     """注册用户；首个用户自动成为 admin。返回 (user, error)"""
+    import re
     username = (username or "").strip()
     if not username or not password:
         return None, "用户名和密码不能为空"
-    if len(password) < 6:
-        return None, "密码至少 6 位"
+    # 用户名仅允许字母/数字/下划线/连字符，长度 3-32，防注入与异常字符
+    if not re.match(r"^[\w-]{3,32}$", username):
+        return None, "用户名仅限字母/数字/_/-，长度 3-32"
+    if len(password) < 8:
+        return None, "密码至少 8 位"
 
     conn = get_conn()
     try:
@@ -115,10 +119,14 @@ def get_user_by_token(token):
 
 
 def _extract_token():
+    # 优先 Authorization / X-Access-Token 头；兼容页面 cookie 登录态
     auth = request.headers.get("Authorization", "")
     if auth.startswith("Bearer "):
         return auth[7:].strip()
-    return request.headers.get("X-Access-Token", "")
+    xat = request.headers.get("X-Access-Token", "")
+    if xat:
+        return xat
+    return request.cookies.get("duratech_pool_token", "")
 
 
 def login_required(fn):

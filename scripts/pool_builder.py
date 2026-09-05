@@ -10,7 +10,7 @@ from datetime import datetime
 from collections import Counter
 
 sys.path.insert(0, str(Path(__file__).parent))
-from config import CATEGORIES, CATEGORY_SHORT_NAMES, WORKSPACE_OUTPUT, OUTPUT_DIR
+from config import CATEGORIES, CATEGORY_SHORT_NAMES, WORKSPACE_OUTPUT, OUTPUT_DIR, SUB_CATEGORIES
 
 WEEKLY_DIR = Path(OUTPUT_DIR) / "weekly"
 PENDING_TRANSFER = Path(OUTPUT_DIR) / "pending_transfer.json"
@@ -49,11 +49,15 @@ WEB_HEADER_EXTRA = """
     <button style="background:#28a745;color:#fff;font-weight:bold;padding:7px 14px;border:none;border-radius:6px;cursor:pointer;font-size:12px;font-family:inherit" onclick="uploadCookie()">📤 上传并开始采集</button>
   </div>
   <textarea id="cookieText" rows="2" placeholder="或直接粘贴 EditThisCookie 导出的 JSON 文本..." style="width:100%;margin-top:8px;font-size:11px;box-sizing:border-box;padding:6px"></textarea>
-  <div id="collectPanel" style="display:none;margin-top:10px">
-    <div style="background:#eee;border-radius:4px;height:14px;overflow:hidden">
-      <div id="progressBar" style="width:0%;height:100%;background:linear-gradient(90deg,#2F5496,#28a745);transition:width .5s"></div>
+  <div id="collectPanel" style="display:none;margin-top:12px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+      <span id="progressStep" style="font-size:12px;font-weight:bold;color:#2F5496">准备中…</span>
+      <span id="progressPct" style="font-size:14px;font-weight:bold;color:#2F5496">0%</span>
     </div>
-    <div id="progressLabel" style="font-size:11px;color:#666;margin-top:4px"></div>
+    <div style="background:#e9ecef;border-radius:8px;height:22px;overflow:hidden;position:relative">
+      <div id="progressBar" style="width:0%;height:100%;background:linear-gradient(90deg,#2F5496,#28a745);transition:width .5s;border-radius:8px"></div>
+    </div>
+    <div id="progressLabel" style="font-size:11px;color:#666;margin-top:6px"></div>
     <pre id="collectLog" style="background:#1a1a2e;color:#7ee787;font-size:10px;border-radius:4px;padding:8px;max-height:150px;overflow:auto;white-space:pre-wrap;margin:6px 0 0"></pre>
   </div>
 </div>
@@ -73,15 +77,21 @@ WEB_HEADER_EXTRA = """
 </div>
 
 <!-- 右上角用户信息 + Cookie 按钮容器（由 JS 动态注入到 header） -->
-<div id="headerRight" style="display:none;align-items:center;gap:10px">
-  <button id="cookieBtn" onclick="toggleCollectCard()" title="上传卖家精灵 Cookie" style="background:rgba(255,255,255,.15);color:#fff;border:1px solid rgba(255,255,255,.3);padding:5px 12px;border-radius:6px;cursor:pointer;font-size:12px;font-family:inherit;white-space:nowrap">🍪 Cookie</button>
-  <button id="userMgmtBtn" onclick="openUserMgmt()" title="用户管理" style="background:rgba(255,255,255,.15);color:#fff;border:1px solid rgba(255,255,255,.3);padding:5px 12px;border-radius:6px;cursor:pointer;font-size:12px;font-family:inherit;white-space:nowrap;display:none">⚙ 用户</button>
-  <span id="headerUser" style="font-size:13px;opacity:.9">👤 <b></b></span>
-  <button id="logoutBtn" onclick="doLogout()" style="background:rgba(220,53,69,.8);color:#fff;border:none;padding:5px 12px;border-radius:6px;cursor:pointer;font-size:12px;font-family:inherit">退出</button>
+<div id="headerRight" style="display:none;align-items:center;gap:8px">
+  <button id="cookieBtn" class="hb-btn outline" onclick="toggleCollectCard()" title="上传卖家精灵 Cookie">🍪 Cookie</button>
+  <button id="userMgmtBtn" class="hb-btn outline" onclick="openUserMgmt()" title="用户管理" style="display:none">⚙ 用户</button>
+  <span id="headerUser" class="hb-user">👤 <b></b></span>
+  <button id="logoutBtn" class="hb-btn danger" onclick="doLogout()">退出</button>
 </div>
 """
 
 WEB_SCRIPT_EXTRA = """
+// ============ 安全工具 ============
+// 转义 HTML 特殊字符，防止产品字段（标题/品牌/备注/类目等用户可控内容）造成 XSS
+function escapeHtml(s) {
+  if (s === null || s === undefined) return '';
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
 // ============ 在线版：登录态 ============
 const TOKEN_KEY = 'duratech_pool_token';
 function getToken() { return localStorage.getItem(TOKEN_KEY) || ''; }
@@ -206,6 +216,7 @@ async function uploadCookie() {
   else fd.append('cookie_text', text);
   fd.append('max_pages', document.getElementById('maxPages').value || '20');
   const t = getToken();
+  showToast('上传中，请稍候…');
   try {
     const resp = await fetch('/api/cookie', {
       method: 'POST',
@@ -213,7 +224,7 @@ async function uploadCookie() {
       body: fd
     });
     const d = await resp.json();
-    if (resp.status === 401) { showLogin(); return; }
+    if (resp.status === 401) { showToast('登录已过期，请重新登录'); showLogin(); return; }
     if (!d.ok) { showToast(d.error || '上传失败'); return; }
     showToast(d.message || 'Cookie 已上传，采集开始');
     document.getElementById('collectPanel').style.display = 'block';
@@ -222,12 +233,22 @@ async function uploadCookie() {
 }
 
 // ============ 在线版：采集进度轮询 ============
+// 状态轮询独立请求：不依赖通用 api() 的 ok 判定，避免状态接口偶发缺 ok 时
+// renderStatus 永不执行、进度弹窗假死在「准备中…/0%」。
 let pollTimer = null;
+async function fetchStatus() {
+  const t = getToken();
+  const headers = {};
+  if (t) headers['Authorization'] = 'Bearer ' + t;
+  const resp = await fetch('/api/collection/status', { headers });
+  if (resp.status === 401) { showLogin(); throw new Error('未登录'); }
+  return await resp.json().catch(() => ({}));
+}
 function startPolling() {
   stopPolling();
   pollTimer = setInterval(async () => {
     try {
-      const d = await api('/api/collection/status');
+      const d = await fetchStatus();
       renderStatus(d);
       if (d.state === 'done') {
         stopPolling();
@@ -237,22 +258,33 @@ function startPolling() {
         stopPolling();
         showToast('❌ 采集失败：' + d.error);
       }
-    } catch (e) { /* 401 已在 api() 处理 */ }
+    } catch (e) { /* 401 已在 fetchStatus 处理 */ }
   }, 3000);
   pollNow();
 }
 async function pollNow() {
-  try { const d = await api('/api/collection/status'); renderStatus(d); } catch (e) {}
+  try { const d = await fetchStatus(); renderStatus(d); } catch (e) {}
 }
 function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
 function renderStatus(d) {
   const bar = document.getElementById('progressBar');
   const label = document.getElementById('progressLabel');
+  const step = document.getElementById('progressStep');
+  const pct = document.getElementById('progressPct');
   const log = document.getElementById('collectLog');
-  const stepNames = { prepare: '准备中', collect_new: '采集新品池', collect_hot: '采集爆品池', diff: '周环比去重', build_pool: '重建需求池看板', done: '完成' };
-  label.textContent = (stepNames[d.step] || d.step || '') + '  ' + d.progress + '%';
-  bar.style.width = (d.progress || 0) + '%';
-  if (d.logs) log.textContent = d.logs.slice(-600);
+  const stepNames = { prepare: '准备中', collect_new: '采集新品池', collect_hot: '采集爆品池', diff: '周环比去重', build_pool: '重建需求池看板', done: '完成', error: '采集失败' };
+  const p = d.progress || 0;
+  const stepName = stepNames[d.step] || d.step || '处理中…';
+  if (bar) bar.style.width = p + '%';
+  if (step) step.textContent = stepName;
+  if (pct) pct.textContent = p + '%';
+  if (label) label.textContent = stepName + ' · ' + p + '%' + (d.state === 'error' ? ' · 失败' : (d.state === 'done' ? ' · 已完成' : ''));
+  if (log && d.logs) log.textContent = d.logs.slice(-600);
+  if (bar) {
+    if (d.state === 'error') bar.style.background = '#dc3545';
+    else if (d.state === 'done') bar.style.background = '#28a745';
+    else bar.style.background = 'linear-gradient(90deg,#2F5496,#28a745)';
+  }
 }
 
 // ============ 在线版：一键导入（直接调 API） ============
@@ -267,9 +299,15 @@ async function transferToDashboard(pool) {
       method: 'POST',
       body: JSON.stringify({ pool: pool, asins: asins })
     });
-    showToast('✅ 已导入 ' + d.selected + ' 条（新增 ' + d.added + ' / 跳过 ' + d.skipped + '）');
-    cbs.forEach(cb => { cb.checked = false; cb.disabled = true; cb.parentElement.parentElement.style.opacity = '0.4'; });
+    showToast('✅ 已导入 ' + d.selected + ' 条（新增 ' + d.added + ' / 跳过 ' + d.skipped + '），需求池已移除 ' + asins.length + ' 条');
+    // 转入成功后：从需求池产品行中移除已转入的 ASIN，并刷新统计/可见数
+    const importedSet = new Set(asins);
+    POOLS[pool] = POOLS[pool].filter(p => !importedSet.has(p.asin));
+    renderPool(pool);
+    document.getElementById(pool + 'Total').textContent = POOLS[pool].length;
     updateCheckCount(pool);
+    applyFilters(pool);
+    buildCatNav();
   } catch (e) { showToast(e.message); }
 }
 
@@ -277,16 +315,15 @@ async function transferToDashboard(pool) {
 async function loadPool() {
   try {
     const d = await api('/api/pool');
-    POOLS.new = (d.new && d.new.products) || [];
-    POOLS.hot = (d.hot && d.hot.products) || [];
+    // 已转入追踪看板的产品（服务端标记 _imported）从需求池行中隐藏
+    POOLS.new = ((d.new && d.new.products) || []).filter(x => !x._imported);
+    POOLS.hot = ((d.hot && d.hot.products) || []).filter(x => !x._imported);
     document.getElementById('newTotal').textContent = POOLS.new.length;
     document.getElementById('hotTotal').textContent = POOLS.hot.length;
     ['new', 'hot'].forEach(p => {
-      const cats = new Set(), labels = new Set();
-      POOLS[p].forEach(x => { if (x.category) cats.add(x.category.split('&')[0].trim()); if (x.__label__) labels.add(x.__label__); });
-      const cs = document.querySelector('.filter-cat[data-pool="' + p + '"]');
-      cs.innerHTML = '<option value="all">全部类目</option>';
-      cats.forEach(c => { const o = document.createElement('option'); o.value = c; o.textContent = c; cs.appendChild(o); });
+      const labels = new Set();
+      POOLS[p].forEach(x => { if (x.__label__) labels.add(x.__label__); });
+      // 类目筛选走左侧类目树(catSelection)，不再重建顶部类目下拉
       const ls = document.querySelector('.filter-label[data-pool="' + p + '"]');
       ls.innerHTML = '<option value="all">全部标签</option>';
       labels.forEach(l => { const o = document.createElement('option'); o.value = l; o.textContent = l; ls.appendChild(o); });
@@ -342,8 +379,10 @@ def load_pool(collect_type):
     return json.loads(candidates[0].read_text())
 
 
+TEMPLATE_POOL = '<!DOCTYPE html>\n<html lang="zh-CN">\n<head>\n<meta charset="UTF-8">\n<meta name="viewport" content="width=device-width, initial-scale=1.0">\n<title>DuraTech 需求池看板 __WEEK__</title>\n<style>\n\n* { margin: 0; padding: 0; box-sizing: border-box; }\nbody { font-family: "Microsoft YaHei", "微软雅黑", Arial, sans-serif; font-size: 13px; background: #f0f2f5; color: #333; }\n\n/* 顶栏：深蓝渐变（传统风格） */\n.header { position: sticky; top: 0; z-index: 50; background: linear-gradient(135deg, #1a3a5c, #2F5496); color: #fff; padding: 14px 24px; display: flex; align-items: center; justify-content: space-between; box-shadow: 0 2px 8px rgba(0,0,0,0.15); }\n.header .brand-block { display: flex; flex-direction: column; gap: 3px; min-width: 0; }\n.header .brand { font-size: 17px; font-weight: bold; display: flex; align-items: center; }\n.header .brand .logo { display: inline-flex; width: 26px; height: 26px; border-radius: 6px; background: rgba(255,255,255,0.22); color: #fff; font-weight: 700; align-items: center; justify-content: center; margin-right: 8px; font-size: 14px; }\n.header .sub { font-size: 11px; color: rgba(255,255,255,0.78); font-weight: 400; line-height: 1.4; }\n.header .sub b { color: #fff; font-weight: 600; }\n\n/* 顶栏右侧按钮（Cookie / 用户 / 退出 / 用户身份） */\n.hb-btn { padding: 6px 14px; border-radius: 4px; font-size: 12px; font-weight: 600; cursor: pointer; font-family: inherit; white-space: nowrap; }\n.hb-btn.outline { background: transparent; color: #fff; border: 1px solid rgba(255,255,255,0.5); }\n.hb-btn.outline:hover { background: rgba(255,255,255,0.15); }\n.hb-btn.danger { background: #dc3545; color: #fff; border: none; }\n.hb-btn.danger:hover { background: #c82333; }\n.hb-user { font-size: 12px; color: #fff; background: rgba(255,255,255,0.15); border: 1px solid rgba(255,255,255,0.3); padding: 6px 14px; border-radius: 4px; font-weight: 500; }\n/* 顶栏右侧缩放控件（自适应） */\n.header-right { display: flex; align-items: center; gap: 10px; }\n.zoom-ctrl { display: flex; align-items: center; gap: 4px; background: rgba(255,255,255,0.14); border: 1px solid rgba(255,255,255,0.3); border-radius: 20px; padding: 4px 8px; }\n.zoom-label { font-size: 11px; color: rgba(255,255,255,0.85); margin-right: 2px; }\n.zoom-val { font-size: 12px; color: #fff; min-width: 40px; text-align: center; font-weight: 600; }\n.zb { width: 22px; height: 22px; border-radius: 50%; border: 1px solid rgba(255,255,255,0.4); background: rgba(255,255,255,0.12); color: #fff; cursor: pointer; font-size: 14px; line-height: 1; display: flex; align-items: center; justify-content: center; font-family: inherit; }\n.zb:hover { background: rgba(255,255,255,0.28); }\n.hb-user b { color: #ffd966; font-weight: 700; margin-left: 2px; }\n\n/* 看板切换导航（需求池 / 产品追踪） */\n.topnav { display: flex; gap: 10px; padding: 0 24px; background: linear-gradient(135deg, #16314f, #24447e); }\n.nav-tab { display: inline-flex; align-items: center; gap: 6px; padding: 11px 22px; color: rgba(255,255,255,0.7); text-decoration: none; font-size: 14px; font-weight: 600; border-bottom: 3px solid transparent; transition: all .15s; white-space: nowrap; }\n.nav-tab:hover { color: #fff; text-decoration: none; }\n.nav-tab.active { color: #fff; background: rgba(255,255,255,0.10); border-bottom-color: #4da3ff; }\n\n/* 布局：左侧导航（工具栏置顶 + 四大类目）+ 右侧内容，各自独立滚动 */\n.layout { display: flex; height: calc(100vh - 98px); overflow: hidden; }\n.sidebar { width: 320px; min-width: 320px; background: #fff; border-right: 1px solid #e0e0e0; display: flex; flex-direction: column; }\n\n/* 左侧置顶工具栏（标签/搜索/全选/导出/转入/显示） */\n.side-tools { padding: 12px 14px; border-bottom: 1px solid #e0e0e0; background: #fafafa; display: flex; flex-direction: column; gap: 8px; }\n.side-tools .inp { width: 100%; padding: 7px 10px; border: 1px solid #ccc; border-radius: 4px; font-size: 12px; background: #fff; font-family: inherit; }\n.side-tools .inp:focus { outline: none; border-color: #2F5496; box-shadow: 0 0 0 2px rgba(47,84,150,0.15); }\n.side-tools .tool-btns { display: flex; gap: 6px; }\n.side-tools .tool-btns .btn { flex: 1; padding: 7px 0; font-size: 11px; }\n.side-tools .count { font-size: 11px; color: #666; }\n.side-tools .count b { color: #2F5496; }\n\n/* 左侧类目导航 */\n.sidebar-head { padding: 12px 16px; border-bottom: 1px solid #e0e0e0; font-size: 13px; font-weight: bold; color: #2F5496; background: #f8f9fa; }\n.cat-nav { flex: 1; overflow-y: auto; padding: 8px 10px; }\n.cat-item { display: flex; align-items: center; justify-content: space-between; width: 100%; padding: 10px 12px; margin-bottom: 4px; border: none; background: transparent; color: #333; font-size: 12px; font-weight: 500; border-radius: 6px; cursor: pointer; font-family: inherit; text-align: left; }\n.cat-item .cname { flex: 1; min-width: 0; word-wrap: break-word; line-height: 1.4; }\n.cat-item .ccnt { margin-left: 8px; font-size: 11px; color: #999; font-weight: 600; }\n.cat-item:hover { background: #f0f2f5; }\n.cat-item.active { background: #2F5496; color: #fff; font-weight: 600; }\n.cat-item.active .ccnt { color: rgba(255,255,255,0.8); }\n\n/* 细分类目分组 */\n.cat-group { margin-bottom: 4px; }\n.cat-l1-title { padding: 8px 12px 4px; font-size: 11px; font-weight: 700; color: #2F5496; border-bottom: 1px solid #e8e8e8; display: flex; justify-content: space-between; align-items: center; cursor: default; }\n.cat-l1-title .ccnt { font-size: 10px; color: #999; font-weight: 400; }\n.cat-sub { padding-left: 20px !important; font-size: 11px; }\n\n.main { flex: 1; min-width: 0; overflow: auto; padding: 16px 24px; }\n\n/* 分段控件（新品/爆品） */\n.seg { display: inline-flex; background: #e9ecef; border-radius: 8px; padding: 3px; margin-bottom: 14px; }\n.seg .sbtn { padding: 7px 18px; border: none; background: transparent; border-radius: 6px; font-size: 13px; font-weight: bold; color: #666; cursor: pointer; font-family: inherit; }\n.seg .sbtn.active { background: #fff; color: #2F5496; box-shadow: 0 1px 3px rgba(0,0,0,0.12); }\n\n/* Tab 面板显隐：仅 active 面板可见，切换才生效 */\n.tab-panel { display: none; }\n.tab-panel.active { display: block; }\n\n/* 统计卡片 */\n.stats-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 12px; }\n.stat-card { background: #f8f9fa; border-radius: 8px; padding: 14px; text-align: center; cursor: pointer; transition: transform .15s, box-shadow .15s; border: 2px solid transparent; user-select: none; }\n.stat-card:hover { transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,0.1); }\n.stat-card.active { border-color: #2F5496; background: #eef2f9; }\n.stat-card .num { font-size: 24px; font-weight: bold; color: #2F5496; }\n.stat-card .label { font-size: 11px; color: #888; margin-top: 4px; }\n\n/* 细分类目统计行 */\n.cat-stats-row { background: linear-gradient(135deg, #eef4fb, #e3edf9); border: 1px solid #c5d8f0; border-radius: 8px; padding: 12px 16px; margin-bottom: 12px; }\n.cat-stats-title { font-size: 13px; font-weight: 700; color: #2F5496; margin-bottom: 8px; }\n.cat-stats-cards { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; }\n.cat-stats-cards .stat-card { background: #fff; }\n\n/* 工具栏 */\n.toolbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; background: #fff; padding: 10px 16px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }\n.toolbar .inp { padding: 6px 12px; border: 1px solid #ccc; border-radius: 4px; font-size: 12px; background: #fff; font-family: inherit; }\n.toolbar .inp:focus { outline: none; border-color: #2F5496; box-shadow: 0 0 0 2px rgba(47,84,150,0.15); }\n.btn { padding: 7px 16px; border: none; border-radius: 4px; font-size: 12px; font-weight: 600; cursor: pointer; font-family: inherit; background: #6c757d; color: #fff; }\n.btn:hover { background: #5a6268; }\n.btn.primary { background: #2F5496; color: #fff; }\n.btn.primary:hover { background: #1e3a6e; }\n.btn.green { background: #28a745; color: #fff; }\n.btn.green:hover { background: #1e7e34; }\n\n/* 表格 */\n.table-card { background: #fff; border-radius: 8px; overflow: visible; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }\n.table-card::-webkit-scrollbar { height: 8px; }\n.table-card::-webkit-scrollbar-thumb { background: #c5d4e8; border-radius: 4px; }\n.table-card::-webkit-scrollbar-track { background: #f0f2f5; }\ntable { width: 100%; min-width: 1080px; border-collapse: separate; border-spacing: 0; }\nthead { position: sticky; top: 0; z-index: 10; }\nth { background: #2F5496; color: #fff; padding: 10px 6px; font-size: 11px; font-weight: 600; text-align: center; white-space: nowrap; border-bottom: 2px solid #1a3a5c; }\ntd { padding: 10px 6px; border-bottom: 1px solid #eee; font-size: 11px; text-align: center; vertical-align: middle; position: relative; z-index: 1; }\ntr:last-child td { border-bottom: none; }\ntr:hover { background: #f8f9ff; }\ntr.filtered { background: #eef2f9; }\nimg.product-img { width: 100px; height: 100px; object-fit: contain; border: 1px solid #eee; border-radius: 4px; background: #fafafa; }\n.title-cell { max-width: 240px; word-wrap: break-word; text-align: left; }\n.num-cell { text-align: right; white-space: nowrap; }\n.price-cell { color: #c00; font-weight: bold; }\n.rating { color: #f0ad4e; font-weight: bold; }\na { color: #2F5496; text-decoration: none; }\na:hover { text-decoration: underline; }\n.growth-note { font-size: 10px; color: #198754; white-space: nowrap; }\n.growth-note.new { color: #0d6efd; }\n.toast { position: fixed; top: 20px; right: 20px; background: #28a745; color: #fff; padding: 10px 20px; border-radius: 4px; z-index: 9999; display: none; font-size: 13px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); }\n/* 横向滚动控制条（表格底部左右滑动） */\n.hscroll-bar { display: none; align-items: center; justify-content: center; gap: 12px; margin-top: 10px; }\n.hscroll-bar.show { display: flex; }\n.hscroll-btn { display: inline-flex; align-items: center; gap: 6px; padding: 7px 18px; border: 1px solid #2F5496; background: #2F5496; color: #fff; border-radius: 20px; font-size: 12px; font-weight: 600; cursor: pointer; font-family: inherit; transition: all .15s; }\n.hscroll-btn:hover { background: #1e3a6e; }\n.hscroll-btn:disabled { background: #c5d4e8; border-color: #c5d4e8; cursor: not-allowed; }\n.hscroll-bar .hint { font-size: 11px; color: #888; }\n@media (max-width: 1200px) { .stats-row { grid-template-columns: repeat(2, 1fr); } .sidebar { width: 280px; min-width: 280px; } .cat-stats-cards { grid-template-columns: repeat(3, 1fr); } }\n@media (max-width: 1000px) { .table-card table { min-width: 1080px; } .main { padding: 12px 14px; } }\n@media (max-width: 768px) {\n  .layout { flex-direction: column; height: auto; overflow: visible; }\n  .sidebar { width: 100%; min-width: 0; max-height: 320px; }\n  .main { overflow: visible; }\n  .stats-row { grid-template-columns: repeat(2, 1fr); }\n  .cat-stats-cards { grid-template-columns: repeat(2, 1fr); }\n  .table-card table { min-width: 980px; }\n}\n\n</style>\n</head>\n<body>\n\n\n<div class="header">\n  <div class="brand-block">\n    <div class="brand"><span class="logo">D</span>DuraTech 需求池看板</div>\n    <div class="sub">周次: <b>__WEEK__</b> · 生成于 __DATE__ · 勾选产品后可转入追踪看板</div>\n  </div>\n  <div class="header-right">\n    <div class="zoom-ctrl">\n      <span class="zoom-label">缩放</span>\n      <button class="zb" onclick="zoomOut()" title="缩小">−</button>\n      <span id="zoomVal" class="zoom-val">100%</span>\n      <button class="zb" onclick="zoomIn()" title="放大">+</button>\n      <button class="zb" onclick="zoomReset()" title="重置">⟳</button>\n    </div>\n    <div id="headerRightArea"></div>\n  </div>\n</div>\n\n<div class="topnav">\n  <a href="/" class="nav-tab active">📋 需求池看板</a>\n  <a href="/tracking" class="nav-tab">📊 产品追踪看板 →</a>\n</div>\n\n\n\n<div class="layout">\n  <aside class="sidebar">\n    <div class="side-tools">\n      <input class="inp filter-search" type="text" placeholder="🔍 搜索 ASIN/品牌/标题..." oninput="applyFilters(activePool)">\n      <div class="tool-btns">\n        <button class="btn" onclick="toggleAll(activePool)">☑ 全选</button>\n        <button class="btn" onclick="exportSelectedCSV(activePool)">📥 导出</button>\n        <button class="btn green" onclick="transferToDashboard(activePool)">📤 转入</button>\n      </div>\n      <div class="count">显示: <b id="visibleCount">0</b>/<b id="totalCount">0</b></div>\n    </div>\n    <div class="sidebar-head">📂 细分类目筛选</div>\n    <nav class="cat-nav" id="catNav"></nav>\n  </aside>\n\n  <main class="main">\n    <div class="seg">\n      <button class="sbtn active" onclick="switchTab(\'new\')">🆕 新品需求池 <b id="newCount">__NEW_TOTAL__</b></button>\n      <button class="sbtn" onclick="switchTab(\'hot\')">🔥 爆品需求池 <b id="hotCount">__HOT_TOTAL__</b></button>\n    </div>\n\n    <!-- 细分类目统计行（选中细分类目后显示） -->\n    <div class="cat-stats-row" id="catStatsRow" style="display:none">\n      <div class="cat-stats-title" id="catStatsTitle"></div>\n      <div class="cat-stats-cards">\n        <div class="stat-card"><div class="num" id="catTotal">0</div><div class="label">该类目产品总数</div></div>\n        <div class="stat-card"><div class="num" id="catNew" style="color:#0d6efd">0</div><div class="label">🆕 新上架产品数</div></div>\n        <div class="stat-card"><div class="num" id="catGrew" style="color:#198754">0</div><div class="label">📈 销量增长产品数</div></div>\n        <div class="stat-card"><div class="num" id="catSales">0</div><div class="label">近30天总销量</div></div>\n        <div class="stat-card"><div class="num" id="catMonthly">0</div><div class="label">总月销售额</div></div>\n      </div>\n    </div>\n\n    <!-- 新品池 -->\n    <div class="tab-panel active" id="tab-new">\n      <div class="stats-row" id="newStatsRow">\n        <div class="stat-card" onclick="filterByGrowth(\'new\', null)"><div class="num" id="newTotal">__NEW_TOTAL__</div><div class="label">产品总数</div></div>\n        <div class="stat-card" id="newCardNew" onclick="filterByGrowth(\'new\', \'new\')"><div class="num" id="newNew" style="color:#2F5496">__NEW_NEW__</div><div class="label">🆕 新上架</div></div>\n        <div class="stat-card" id="newCardGrew" onclick="filterByGrowth(\'new\', \'grew\')"><div class="num" id="newGrew" style="color:#198754">__NEW_GREW__</div><div class="label">📈 销量增长</div></div>\n        <div class="stat-card"><div class="num" id="newSelected" style="color:#2F5496">0</div><div class="label">已勾选</div></div>\n      </div>\n      <div class="table-card">\n        <table><thead><tr>\n          <th style="width:28px"><input type="checkbox" class="check-all" data-pool="new" onchange="toggleAll(\'new\')" title="全选"></th>\n          <th style="width:110px">主图</th><th>ASIN</th><th style="width:70px">品牌</th><th>标题</th>\n          <th>近30天销量</th><th>月销售额</th><th>售价</th><th>上架时间</th><th>评分</th><th>评论</th><th>BSR</th><th>变体</th><th>📝 备注</th>\n        </tr></thead>\n        <tbody id="newBody"></tbody></table>\n      </div>\n      <div class="hscroll-bar" id="hscroll-new" data-target="new">\n        <button class="hscroll-btn" onclick="hScroll(\'new\', -1)" id="hscroll-left-new">← 向左</button>\n        <span class="hint">拖动查看未显示的产品信息</span>\n        <button class="hscroll-btn" onclick="hScroll(\'new\', 1)" id="hscroll-right-new">向右 →</button>\n      </div>\n    </div>\n\n    <!-- 爆品池 -->\n    <div class="tab-panel" id="tab-hot">\n      <div class="stats-row" id="hotStatsRow">\n        <div class="stat-card" onclick="filterByGrowth(\'hot\', null)"><div class="num" id="hotTotal">__HOT_TOTAL__</div><div class="label">产品总数</div></div>\n        <div class="stat-card" id="hotCardNew" onclick="filterByGrowth(\'hot\', \'new\')"><div class="num" id="hotNew" style="color:#2F5496">__HOT_NEW__</div><div class="label">🆕 新上架</div></div>\n        <div class="stat-card" id="hotCardGrew" onclick="filterByGrowth(\'hot\', \'grew\')"><div class="num" id="hotGrew" style="color:#198754">__HOT_GREW__</div><div class="label">📈 销量增长</div></div>\n        <div class="stat-card"><div class="num" id="hotSelected" style="color:#2F5496">0</div><div class="label">已勾选</div></div>\n      </div>\n      <div class="table-card">\n        <table><thead><tr>\n          <th style="width:28px"><input type="checkbox" class="check-all" data-pool="hot" onchange="toggleAll(\'hot\')" title="全选"></th>\n          <th style="width:110px">主图</th><th>ASIN</th><th style="width:70px">品牌</th><th>标题</th>\n          <th>近30天销量</th><th>月销售额</th><th>售价</th><th>上架时间</th><th>评分</th><th>评论</th><th>BSR</th><th>变体</th><th>📝 备注</th>\n        </tr></thead>\n        <tbody id="hotBody"></tbody></table>\n      </div>\n      <div class="hscroll-bar" id="hscroll-hot" data-target="hot">\n        <button class="hscroll-btn" onclick="hScroll(\'hot\', -1)" id="hscroll-left-hot">← 向左</button>\n        <span class="hint">拖动查看未显示的产品信息</span>\n        <button class="hscroll-btn" onclick="hScroll(\'hot\', 1)" id="hscroll-right-hot">向右 →</button>\n      </div>\n    </div>\n  </main>\n</div>\n\n<div class="toast" id="toast"></div>\n\n__HEADER_EXTRA__\n\n<script>\nconst POOLS = {\n  new: __NEW_JSON__,\n  hot: __HOT_JSON__\n};\nconst LABEL_COLORS = __LABEL_COLORS__;\n\n\nlet catSelection = \'\';\nlet activePool = \'new\';\n\n// ===== 细分类目树（从 Python config 注入） =====\nconst SUB_CAT_TREE = __SUB_CAT_TREE__;\n// 扁平化所有目标细分类目名称（用于侧栏展示）\nfunction flattenTree(tree) {\n  const items = [];\n  for (const [l1, subs] of Object.entries(tree)) {\n    for (const s of subs) items.push({ l1, ...s });\n  }\n  return items;\n}\nconst ALL_SUB_CATS = flattenTree(SUB_CAT_TREE);\n\n// ===== Tab 切换 =====\nfunction switchTab(tab) {\n  activePool = tab;\n  document.querySelectorAll(\'.seg .sbtn\').forEach(b => b.classList.remove(\'active\'));\n  document.querySelectorAll(\'.seg .sbtn\')[tab === \'new\' ? 0 : 1].classList.add(\'active\');\n  document.querySelectorAll(\'.tab-panel\').forEach(c => c.classList.remove(\'active\'));\n  document.getElementById(\'tab-\' + tab).classList.add(\'active\');\n  // 切换池时重置筛选，给干净视图\n  catSelection = \'\';\n  document.querySelector(\'.filter-search\').value = \'\';\n  buildCatNav();\n  applyFilters(tab);\n  updateCatStats(tab);\n  updateHScroll(tab);\n}\n\n// ===== HTML 转义 =====\nfunction esc(s) { return (s || \'\').replace(/&/g, \'&amp;\').replace(/"/g, \'&quot;\').replace(/\'/g, \'&#39;\'); }\nfunction escapeHtml(s) { return esc(s); }\n\n// ===== 左侧导航：细分类目树 =====\nfunction buildCatNav() {\n  const nav = document.getElementById(\'catNav\');\n  const pool = POOLS[activePool];\n  const total = pool.length;\n  let html = \'\';\n\n  // 「全部产品」置顶\n  html += \'<button class="cat-item\' + (catSelection === \'\' ? \' active\' : \'\') + \'" data-cat="" onclick="pickCat(this)"><span class="cname">🏠 全部产品</span><span class="ccnt">\' + total + \'</span></button>\';\n\n  // 按一级类目分组，每组下挂细分类目\n  for (const [l1, subs] of Object.entries(SUB_CAT_TREE)) {\n    // 一级类目标题（不可点击，仅分组标题）\n    const l1Cnt = pool.filter(p => (p.category || p.fine_category || \'\') === l1 ||\n      (p.category_l1 || \'\') === l1 || subs.some(s => (p.fine_category || p.category_leaf || p.category_l2 || \'\').toLowerCase() === s.name.toLowerCase())).length;\n    html += \'<div class="cat-group"><div class="cat-l1-title">\' + esc(l1) + \'<span class="ccnt">\' + l1Cnt + \'</span></div>\';\n    // 细分类目按钮\n    for (const s of subs) {\n      // 匹配策略：fine_category > category_leaf > category_l3 > category_l2 （大小写不敏感）\n      const sNameLower = s.name.toLowerCase();\n      const cnt = pool.filter(p => {\n        const fc = (p.fine_category || p.category_leaf || p.category_l3 || p.category_l2 || \'\').toLowerCase();\n        const pL1 = (p.category_l1 || p.category || \'\').toLowerCase();\n        return fc === sNameLower && pL1 === l1.toLowerCase();\n      }).length;\n      const label = s.cn ? s.name + \' (\' + s.cn + \')\' : s.name;\n      const catKey = l1 + \'::\' + s.name;\n      const isActive = catSelection === catKey;\n      html += \'<button class="cat-item cat-sub\' + (isActive ? \' active\' : \'\') + \'" data-cat="\' + esc(catKey) + \'" onclick="pickCat(this)" title="\' + esc(label) + \'"><span class="cname">\' + esc(label) + \'</span><span class="ccnt">\' + cnt + \'</span></button>\';\n    }\n    html += \'</div>\';  // end cat-group\n  }\n  nav.innerHTML = html;\n}\n\nfunction pickCat(btn) {\n  catSelection = btn.dataset.cat || \'\';\n  buildCatNav();\n  applyFilters(activePool);\n  updateCatStats(activePool);\n}\n\n// ===== 渲染表格 =====\nfunction createRow(p, pool) {\n  const tr = document.createElement(\'tr\');\n  // 仅 image 走可信来源（亚马逊官方图床），其余字段一律 escapeHtml 防止 XSS\n  const img = p.image ? \'<img class="product-img" src="\' + escapeHtml(p.image) + \'" loading="lazy">\' : \'<img class="product-img" src="" style="visibility:hidden">\';\n  tr.dataset.category = p.category_l1 || p.category || \'\';\n  // 细分类目（用于侧栏筛选）：优先 fine_category > category_leaf > category_l3 > category_l2 > category\n  tr.dataset.fineCategory = (p.fine_category || p.category_leaf || p.category_l3 || p.category_l2 || p.category || \'\');\n  const growthClass = (p._growth_note || \'\').startsWith(\'🆕\') ? \'new\' : \'\';\n  tr.innerHTML = \'<td style="text-align:center"><input type="checkbox" class="row-cb" data-asin="\' + escapeHtml(p.asin) + \'" data-pool="\' + pool + \'" onchange="updateCheckCount(this.dataset.pool)"\' + (p._imported ? \' disabled\' : \'\') + \'></td>\'\n    + (p._imported ? \'<td style="opacity:0.45">\' + img + \'</td>\' : \'<td>\' + img + \'</td>\')\n    + \'<td><a href="https://www.amazon.com/dp/\' + escapeHtml(p.asin) + \'" target="_blank">\' + escapeHtml(p.asin) + \'</a></td>\'\n    + \'<td>\' + escapeHtml(p.brand || \'\') + \'</td>\'\n    + \'<td class="title-cell" title="\' + escapeHtml(p.title || \'\') + \'">\' + escapeHtml(p.title || \'\') + \'</td>\'\n    + \'<td class="num-cell">\' + escapeHtml(p.sales || \'\') + \'</td>\'\n    + \'<td class="num-cell">\' + escapeHtml(p.monthly_sales || \'\') + \'</td>\'\n    + \'<td class="num-cell price-cell">\' + escapeHtml(p.price || \'\') + \'</td>\'\n    + \'<td>\' + escapeHtml(p.available || \'\') + \'</td>\'\n    + \'<td class="num-cell rating">\' + escapeHtml(p.rating || \'\') + \'</td>\'\n    + \'<td class="num-cell">\' + escapeHtml(p.reviews || \'\') + \'</td>\'\n    + \'<td class="num-cell">\' + escapeHtml(p.bsr || \'\') + \'</td>\'\n    + \'<td class="num-cell">\' + escapeHtml(p.variants || \'\') + \'</td>\'\n    + \'<td><span class="growth-note \' + growthClass + \'">\' + escapeHtml(p._growth_note || \'\') + \'</span></td>\';\n  return tr;\n}\n\nfunction renderPool(pool) {\n  const tbody = document.getElementById(pool + \'Body\');\n  tbody.innerHTML = \'\';\n  POOLS[pool].forEach(p => tbody.appendChild(createRow(p, pool)));\n}\n\n// ===== 筛选 =====\nconst growthFilter = {};\n\nfunction applyFilters(pool) {\n  const fs = document.querySelector(\'.filter-search\').value.toLowerCase();\n  const gf = growthFilter[pool] || null;\n  const tbody = document.getElementById(pool + \'Body\');\n  const rows = tbody.querySelectorAll(\'tr\');\n  let visible = 0;\n  // 细分类目筛选：大小写不敏感匹配\n  let selL1 = \'\', selSub = \'\';\n  if (catSelection) {\n    const parts = catSelection.split(\'::\');\n    selL1 = (parts[0] || \'\').toLowerCase();\n    selSub = (parts[1] || \'\').toLowerCase();\n  }\n  rows.forEach(row => {\n    const fineCat = (row.dataset.fineCategory || \'\').toLowerCase();\n    const asin = (row.querySelector(\'a\')?.textContent || \'\').toLowerCase();\n    const brand = (row.cells[3]?.textContent || \'\').toLowerCase();\n    const title = (row.querySelector(\'.title-cell\')?.textContent || \'\').toLowerCase();\n    const growthNote = (row.querySelector(\'.growth-note\')?.textContent || \'\').trim();\n    let show = true;\n    if (selSub && (fineCat !== selSub || (selL1 && (row.dataset.category || \'\').toLowerCase() !== selL1))) show = false;\n    if (fs && !(asin.includes(fs) || brand.includes(fs) || title.includes(fs))) show = false;\n    if (gf === \'new\' && !growthNote.startsWith(\'🆕\')) show = false;\n    if (gf === \'grew\' && !growthNote.startsWith(\'📈\')) show = false;\n    row.style.display = show ? \'\' : \'none\';\n    if (show) visible++;\n  });\n  if (pool === activePool) {\n    document.getElementById(\'visibleCount\').textContent = visible;\n    document.getElementById(\'totalCount\').textContent = POOLS[pool].length;\n  }\n}\n\n// ===== 细分类目统计（选中细分类目后自动统计该类目指标） =====\nfunction parseNum(v) {\n  if (v === null || v === undefined || v === \'\') return 0;\n  const n = parseFloat(String(v).replace(/[, ]/g, \'\'));\n  return isNaN(n) ? 0 : n;\n}\nfunction fmtNum(v) { return Math.round(v).toLocaleString(\'en-US\'); }\n\nfunction fineCatOf(p) {\n  return (p.fine_category || p.category_leaf || p.category_l3 || p.category_l2 || p.category || \'\').toLowerCase();\n}\n\nfunction updateCatStats(pool) {\n  const catRow = document.getElementById(\'catStatsRow\');\n  const origRow = document.getElementById(pool + \'StatsRow\');\n  const title = document.getElementById(\'catStatsTitle\');\n  const sel = (catSelection || \'\').trim();\n  if (!sel) {\n    catRow.style.display = \'none\';\n    if (origRow) origRow.style.display = \'\';\n    return;\n  }\n  const parts = sel.split(\'::\');\n  const selL1 = (parts[0] || \'\').toLowerCase();\n  const selSub = (parts[1] || \'\').toLowerCase();\n  const matched = POOLS[pool].filter(p => {\n    const pL1 = (p.category_l1 || p.category || \'\').toLowerCase();\n    return fineCatOf(p) === selSub && (!selL1 || pL1 === selL1);\n  });\n  let newCnt = 0, grewCnt = 0, totalSales = 0, totalMonthly = 0;\n  matched.forEach(p => {\n    const note = (p._growth_note || \'\');\n    if (note.startsWith(\'🆕\')) newCnt++;\n    if (note.startsWith(\'📈\')) grewCnt++;\n    totalSales += parseNum(p.sales);\n    totalMonthly += parseNum(p.monthly_sales);\n  });\n  const titleName = (parts[1] || sel);\n  title.textContent = \'📊 \' + titleName + \' · 本次需求池统计（\' + (pool === \'new\' ? \'新品\' : \'爆品\') + \'）\';\n  document.getElementById(\'catTotal\').textContent = matched.length;\n  document.getElementById(\'catNew\').textContent = newCnt;\n  document.getElementById(\'catGrew\').textContent = grewCnt;\n  document.getElementById(\'catSales\').textContent = fmtNum(totalSales);\n  document.getElementById(\'catMonthly\').textContent = \'$\' + fmtNum(totalMonthly);\n  catRow.style.display = \'block\';\n  // 选中细分类目时隐藏原有的全池统计行，避免重复\n  if (origRow) origRow.style.display = \'none\';\n}\n\nfunction filterByGrowth(pool, type) {\n  if (type === null) {\n    growthFilter[pool] = null;\n    document.getElementById(pool + \'CardNew\').classList.remove(\'active\');\n    document.getElementById(pool + \'CardGrew\').classList.remove(\'active\');\n    applyFilters(pool); return;\n  }\n  if (growthFilter[pool] === type) {\n    growthFilter[pool] = null;\n    document.getElementById(pool + \'CardNew\').classList.remove(\'active\');\n    document.getElementById(pool + \'CardGrew\').classList.remove(\'active\');\n  } else {\n    growthFilter[pool] = type;\n    document.getElementById(pool + \'CardNew\').classList.toggle(\'active\', type === \'new\');\n    document.getElementById(pool + \'CardGrew\').classList.toggle(\'active\', type === \'grew\');\n  }\n  applyFilters(pool);\n}\n\nfunction toggleAll(pool) {\n  const checkAll = document.querySelector(\'.check-all[data-pool="\' + pool + \'"]\');\n  const rows = document.querySelectorAll(\'#\' + pool + \'Body tr\');\n  let anyChecked = false;\n  rows.forEach(row => { if (row.style.display !== \'none\' && row.querySelector(\'.row-cb\').checked) anyChecked = true; });\n  const targetState = !anyChecked;\n  rows.forEach(row => { if (row.style.display !== \'none\') row.querySelector(\'.row-cb\').checked = targetState; });\n  checkAll.checked = targetState;\n  updateCheckCount(pool);\n}\n\nfunction updateCheckCount(pool) {\n  const cbs = document.querySelectorAll(\'#\' + pool + \'Body .row-cb:checked\');\n  document.getElementById(pool + \'Selected\').textContent = cbs.length;\n}\n\nfunction exportSelectedCSV(pool) {\n  const cbs = document.querySelectorAll(\'#\' + pool + \'Body .row-cb:checked\');\n  if (cbs.length === 0) { showToast(\'请先勾选产品\'); return; }\n  const headers = [\'类目\',\'ASIN\',\'品牌\',\'标题\',\'来源\',\'近30天销量\',\'月销售额\',\'售价\',\'上架时间\',\'评分\',\'评论数\',\'BSR\',\'变体数\',\'主图链接\',\'备注\'];\n  const selected = [];\n  cbs.forEach(cb => {\n    const p = POOLS[pool].find(x => x.asin === cb.dataset.asin);\n    if (p) selected.push([p.category||\'\', p.asin, p.brand||\'\', p.title||\'\',\n      p._source||\'\', p.sales||\'\', p.monthly_sales||\'\', p.price||\'\', p.available||\'\',\n      p.rating||\'\', p.reviews||\'\', p.bsr||\'\', p.variants||\'\', p.image||\'\', p._growth_note||\'\']);\n  });\n  let csv = \'\\uFEFF\' + headers.join(\',\') + \'\\n\';\n  selected.forEach(r => csv += r.map(v => \'"\' + (v||\'\').replace(/"/g, \'""\') + \'"\').join(\',\') + \'\\n\');\n  const blob = new Blob([csv], { type: \'text/csv;charset=utf-8\' });\n  const url = URL.createObjectURL(blob);\n  const a = document.createElement(\'a\');\n  a.href = url; a.download = \'DuraTech_\' + (pool === \'new\' ? \'新品\' : \'爆品\') + \'_勾选_\' + new Date().toISOString().slice(0,10) + \'.csv\';\n  a.click(); URL.revokeObjectURL(url);\n  showToast(\'已导出 \' + selected.length + \' 条\');\n}\n\nfunction transferToDashboard(pool) {\n  const cbs = document.querySelectorAll(\'#\' + pool + \'Body .row-cb:checked\');\n  if (cbs.length === 0) { showToast(\'请先勾选要转入的产品\'); return; }\n  if (!confirm(\'确定将 \' + cbs.length + \' 个产品转入 DuraTech 产品追踪看板吗？\')) return;\n  const selected = [];\n  cbs.forEach(cb => {\n    const p = POOLS[pool].find(x => x.asin === cb.dataset.asin);\n    if (p) {\n      p.__label__ = p.__label__ || (pool === \'new\' ? \'潜力新品\' : \'标准爆品\');\n      p._source = p._source || (pool === \'new\' ? \'new\' : \'hot\');\n      selected.push(p);\n    }\n  });\n  const json = JSON.stringify({ pool: pool, products: selected, transfer_time: new Date().toISOString() }, null, 2);\n  const blob = new Blob([json], { type: \'application/json;charset=utf-8\' });\n  const url = URL.createObjectURL(blob);\n  const a = document.createElement(\'a\');\n  a.href = url; a.download = \'pending_transfer_\' + new Date().toISOString().slice(0,10) + \'.json\';\n  a.click(); URL.revokeObjectURL(url);\n  showToast(\'已导出 \' + selected.length + \' 条转入文件！请将下载的 JSON 发给我，我会自动更新追踪看板\');\n  cbs.forEach(cb => { cb.parentElement.parentElement.style.opacity = \'0.4\'; cb.disabled = true; });\n}\n\nfunction showToast(msg) {\n  const t = document.getElementById(\'toast\');\n  t.textContent = msg; t.style.display = \'block\';\n  setTimeout(() => t.style.display = \'none\', 3000);\n}\n\n// ===== 页面缩放（自适应分辨率 / 缩放大小） =====\nlet currentZoom = parseFloat(localStorage.getItem(\'dt_zoom\') || \'1\') || 1;\nfunction applyZoom() {\n  document.documentElement.style.zoom = currentZoom;\n  const z = document.getElementById(\'zoomVal\');\n  if (z) z.textContent = Math.round(currentZoom * 100) + \'%\';\n}\nfunction zoomIn() { currentZoom = Math.min(1.8, Math.round((currentZoom + 0.1) * 10) / 10); localStorage.setItem(\'dt_zoom\', currentZoom); applyZoom(); }\nfunction zoomOut() { currentZoom = Math.max(0.6, Math.round((currentZoom - 0.1) * 10) / 10); localStorage.setItem(\'dt_zoom\', currentZoom); applyZoom(); }\nfunction zoomReset() { currentZoom = 1; localStorage.removeItem(\'dt_zoom\'); applyZoom(); }\n\n// ===== 横向滚动控制（查看未显示全的产品信息） =====\nfunction hScroll(pool, dir) {\n  const card = document.querySelector(\'.main\');\n  if (!card) return;\n  const step = Math.max(200, Math.round(card.clientWidth * 0.6));\n  card.scrollBy({ left: dir * step, behavior: \'smooth\' });\n  setTimeout(() => updateHScroll(pool), 350);\n}\n\nfunction updateHScroll(pool) {\n  const card = document.querySelector(\'.main\');\n  const bar = document.getElementById(\'hscroll-\' + pool);\n  if (!card || !bar) return;\n  const overflow = card.scrollWidth - card.clientWidth > 2;\n  bar.classList.toggle(\'show\', overflow);\n  if (!overflow) return;\n  const leftBtn = document.getElementById(\'hscroll-left-\' + pool);\n  const rightBtn = document.getElementById(\'hscroll-right-\' + pool);\n  if (leftBtn) leftBtn.disabled = card.scrollLeft <= 2;\n  if (rightBtn) rightBtn.disabled = card.scrollLeft + card.clientWidth >= card.scrollWidth - 2;\n}\n\n// ===== 初始化 =====\n[\'new\', \'hot\'].forEach(pool => renderPool(pool));\nbuildCatNav();\napplyZoom();\napplyFilters(\'new\');\nupdateHScroll(\'new\');\nupdateHScroll(\'hot\');\nwindow.addEventListener(\'resize\', () => { updateHScroll(activePool); });\n\n\n__SCRIPT_EXTRA__\n</script>\n</body>\n</html>'
+
 def build_pool_dashboard(output_path=None, web_mode=False):
-    """生成需求池看板 HTML
+    """生成需求池看板 HTML（传统皮肤 + 左侧细分类目树 + 中英双语 + 缩放/横向滚动）
     web_mode=True: 在线版（Cookie 上传 / 采集进度 / 一键导入 API / 登录）"""
     new_pool = load_pool("new")
     hot_pool = load_pool("hot")
@@ -365,387 +404,29 @@ def build_pool_dashboard(output_path=None, web_mode=False):
     new_json = json.dumps(new_products, ensure_ascii=False)
     hot_json = json.dumps(hot_products, ensure_ascii=False)
     label_colors_json = json.dumps(LABEL_COLORS, ensure_ascii=False)
+    sub_cat_tree_json = json.dumps(SUB_CATEGORIES, ensure_ascii=False)
 
     # 在线版注入额外 UI / JS
     header_extra = WEB_HEADER_EXTRA if web_mode else ""
     script_extra = WEB_SCRIPT_EXTRA if web_mode else ""
 
-    html = f"""<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>DuraTech 需求池看板 {week_label}</title>
-<style>
-* {{ margin: 0; padding: 0; box-sizing: border-box; }}
-body {{ font-family: "Microsoft YaHei", "微软雅黑", Arial, sans-serif; font-size: 13px; background: #f0f2f5; }}
-.header {{ background: linear-gradient(135deg, #1a3a5c, #2F5496); color: #fff; padding: 16px 24px; display: flex; align-items: flex-start; justify-content: space-between; }}
-.header .header-left {{ flex: 1; min-width: 0; }}
-.header h1 {{ font-size: 20px; margin-bottom: 4px; }}
-.header .sub {{ font-size: 12px; opacity: 0.8; }}
-.header .nav-link {{ color: rgba(255,255,255,.8); text-decoration: none; font-size: 13px; margin-left: 16px; transition: color .15s; white-space: nowrap; }}
-.header .nav-link:hover {{ color: #fff; }}
-/* 看板切换导航（需求池 / 产品追踪） */
-.topnav {{ display: flex; gap: 10px; padding: 0 24px; background: linear-gradient(135deg, #16314f, #24447e); }}
-.nav-tab {{ display: inline-flex; align-items: center; gap: 6px; padding: 11px 22px; color: rgba(255,255,255,.7); text-decoration: none; font-size: 14px; font-weight: 600; border-bottom: 3px solid transparent; transition: all .15s; white-space: nowrap; }}
-.nav-tab:hover {{ color: #fff; text-decoration: none; }}
-.nav-tab.active {{ color: #fff; background: rgba(255,255,255,.10); border-bottom-color: #4da3ff; }}
-/* Tab 切换 */
-.tabs {{ display: flex; margin: 16px 24px 0; gap: 0; }}
-.tab-btn {{ padding: 10px 28px; border: none; background: #e9ecef; cursor: pointer; font-size: 14px; font-family: inherit; border-radius: 8px 8px 0 0; font-weight: bold; color: #666; }}
-.tab-btn.active {{ background: #fff; color: #2F5496; box-shadow: 0 -2px 6px rgba(0,0,0,0.08); }}
-.tab-content {{ display: none; }}
-.tab-content.active {{ display: block; }}
-/* 统计行 */
-.stats-row {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; padding: 12px 24px; background: #fff; }}
-.stat-card {{ background: #f8f9fa; border-radius: 8px; padding: 12px; text-align: center; cursor: pointer; transition: transform 0.15s, box-shadow 0.15s; border: 2px solid transparent; user-select: none; }}
-.stat-card:hover {{ transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,0.1); }}
-.stat-card.active {{ border-color: #2F5496; background: #eef2f9; }}
-.stat-card .num {{ font-size: 24px; font-weight: bold; color: #2F5496; }}
-.stat-card .label {{ font-size: 11px; color: #888; margin-top: 4px; }}
-/* 工具栏 */
-.toolbar {{ background: #fff; margin: 0 24px; border-top: 1px solid #eee; padding: 10px 16px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }}
-.toolbar select, .toolbar input {{ padding: 5px 10px; border: 1px solid #ccc; border-radius: 4px; font-size: 12px; font-family: inherit; }}
-.toolbar button {{ padding: 6px 14px; border: none; border-radius: 4px; cursor: pointer; font-size: 12px; font-family: inherit; }}
-.btn-transfer {{ background: #28a745; color: #fff; font-weight: bold; }}
-.btn-transfer:hover {{ background: #1e7e34; }}
-.btn-export {{ background: #2F5496; color: #fff; }}
-.btn-export:hover {{ background: #1e3a6e; }}
-.btn-select {{ background: #6c757d; color: #fff; }}
-.toolbar .count {{ margin-left: auto; font-weight: bold; color: #2F5496; }}
-/* 表格 */
-.table-wrap {{ margin: 0 24px 24px; background: #fff; border-radius: 0 0 8px 8px; overflow: visible; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
-table {{ width: 100%; border-collapse: collapse; }}
-th {{ background: #2F5496; color: #fff; padding: 8px 6px; font-size: 11px; text-align: center; white-space: nowrap; position: sticky; top: 0; z-index: 10; }}
-td {{ padding: 10px 6px; border-bottom: 1px solid #eee; font-size: 11px; vertical-align: middle; }}
-tr:hover {{ background: #f8f9ff; }}
-img.product-img {{ width: 100px; height: 100px; object-fit: contain; border: 1px solid #eee; border-radius: 4px; background: #fafafa; }}
-.label-badge {{ display: inline-block; padding: 2px 7px; border-radius: 3px; font-size: 10px; font-weight: bold; }}
-.title-cell {{ max-width: 260px; word-wrap: break-word; }}
-.num-cell {{ text-align: right; white-space: nowrap; }}
-.price-cell {{ color: #c00; font-weight: bold; }}
-.rating {{ color: #f0ad4e; font-weight: bold; }}
-a {{ color: #2F5496; text-decoration: none; }}
-a:hover {{ text-decoration: underline; }}
-.growth-note {{ font-size: 10px; color: #198754; white-space: nowrap; }}
-.growth-note.new {{ color: #0d6efd; }}
-.toast {{ position: fixed; top: 20px; right: 20px; background: #28a745; color: #fff; padding: 10px 20px; border-radius: 4px; z-index: 9999; display: none; font-size: 13px; }}
-@media (max-width: 1200px) {{ .stats-row {{ grid-template-columns: repeat(3, 1fr); }} }}
-</style>
-</head>
-<body>
+    html = TEMPLATE_POOL
 
-<div class="header">
-  <div class="header-left">
-    <h1>📋 DuraTech 需求池看板</h1>
-    <div class="sub">周次: {week_label} · 生成于 {date_str} · 勾选产品后可转入追踪看板</div>
-  </div>
-  <div id="headerRightArea"></div>
-</div>
-
-<div class="topnav">
-  <a href="/" class="nav-tab active">📋 需求池看板</a>
-  <a href="/tracking" class="nav-tab">📊 产品追踪看板 →</a>
-</div>
-
-{header_extra}
-
-<div class="tabs">
-  <button class="tab-btn active" onclick="switchTab('new')">🆕 新品需求池 <span id="newCount">{len(new_products)}</span></button>
-  <button class="tab-btn" onclick="switchTab('hot')">🔥 爆品需求池 <span id="hotCount">{len(hot_products)}</span></button>
-</div>
-
-<!-- 新品池 -->
-<div class="tab-content active" id="tab-new">
-<div class="stats-row">
-  <div class="stat-card" onclick="filterByGrowth('new', null)"><div class="num" id="newTotal">{len(new_products)}</div><div class="label">产品总数</div></div>
-  <div class="stat-card" id="newCardNew" onclick="filterByGrowth('new', 'new')"><div class="num" id="newNew">{new_stats.get('new', 0)}</div><div class="label">🆕 新上架</div></div>
-  <div class="stat-card" id="newCardGrew" onclick="filterByGrowth('new', 'grew')"><div class="num" id="newGrew" style="color:#198754">{new_stats.get('grew', 0)}</div><div class="label">📈 销量增长</div></div>
-  <div class="stat-card" id="newCardSelected"><div class="num" id="newSelected" style="color:#2F5496">0</div><div class="label">已勾选</div></div>
-</div>
-<div class="toolbar">
-  <label>类目:</label>
-  <select class="filter-cat" data-pool="new" onchange="applyFilters('new')">
-    <option value="all">全部类目</option>
-  </select>
-  <label>标签:</label>
-  <select class="filter-label" data-pool="new" onchange="applyFilters('new')">
-    <option value="all">全部标签</option>
-  </select>
-  <label>搜索:</label>
-  <input type="text" class="filter-search" data-pool="new" placeholder="ASIN/品牌/标题..." oninput="applyFilters('new')">
-  <button class="btn-select" onclick="toggleAll('new')">☑ 全选/反选</button>
-  <button class="btn-export" onclick="exportSelectedCSV('new')">📥 导出勾选 Excel</button>
-  <button class="btn-transfer" onclick="transferToDashboard('new')">📤 转入追踪看板</button>
-  <span class="count">显示: <span id="newVisible">{len(new_products)}</span>/{len(new_products)}</span>
-</div>
-<div class="table-wrap">
-<table><thead><tr>
-  <th style="width:28px"><input type="checkbox" class="check-all" data-pool="new" onchange="toggleAll('new')" title="全选"></th>
-  <th style="width:110px">主图</th><th>类目</th><th>ASIN</th><th style="width:70px">品牌</th><th>标题</th><th>标签</th>
-  <th>近30天销量</th><th>月销售额</th><th>售价</th><th>上架时间</th>
-  <th>评分</th><th>评论</th><th>BSR</th><th>变体</th><th>📝 备注</th>
-</tr></thead>
-<tbody id="newBody"></tbody></table>
-</div>
-</div>
-
-<!-- 爆品池 -->
-<div class="tab-content" id="tab-hot">
-<div class="stats-row">
-  <div class="stat-card" onclick="filterByGrowth('hot', null)"><div class="num" id="hotTotal">{len(hot_products)}</div><div class="label">产品总数</div></div>
-  <div class="stat-card" id="hotCardNew" onclick="filterByGrowth('hot', 'new')"><div class="num" id="hotNew">{hot_stats.get('new', 0)}</div><div class="label">🆕 新上架</div></div>
-  <div class="stat-card" id="hotCardGrew" onclick="filterByGrowth('hot', 'grew')"><div class="num" id="hotGrew" style="color:#198754">{hot_stats.get('grew', 0)}</div><div class="label">📈 销量增长</div></div>
-  <div class="stat-card"><div class="num" id="hotSelected" style="color:#2F5496">0</div><div class="label">已勾选</div></div>
-</div>
-<div class="toolbar">
-  <label>类目:</label>
-  <select class="filter-cat" data-pool="hot" onchange="applyFilters('hot')">
-    <option value="all">全部类目</option>
-  </select>
-  <label>标签:</label>
-  <select class="filter-label" data-pool="hot" onchange="applyFilters('hot')">
-    <option value="all">全部标签</option>
-  </select>
-  <label>搜索:</label>
-  <input type="text" class="filter-search" data-pool="hot" placeholder="ASIN/品牌/标题..." oninput="applyFilters('hot')">
-  <button class="btn-select" onclick="toggleAll('hot')">☑ 全选/反选</button>
-  <button class="btn-export" onclick="exportSelectedCSV('hot')">📥 导出勾选 Excel</button>
-  <button class="btn-transfer" onclick="transferToDashboard('hot')">📤 转入追踪看板</button>
-  <span class="count">显示: <span id="hotVisible">{len(hot_products)}</span>/{len(hot_products)}</span>
-</div>
-<div class="table-wrap">
-<table><thead><tr>
-  <th style="width:28px"><input type="checkbox" class="check-all" data-pool="hot" onchange="toggleAll('hot')" title="全选"></th>
-  <th style="width:110px">主图</th><th>类目</th><th>ASIN</th><th style="width:70px">品牌</th><th>标题</th><th>标签</th>
-  <th>近30天销量</th><th>月销售额</th><th>售价</th><th>上架时间</th>
-  <th>评分</th><th>评论</th><th>BSR</th><th>变体</th><th>📝 备注</th>
-</tr></thead>
-<tbody id="hotBody"></tbody></table>
-</div>
-</div>
-
-<div class="toast" id="toast"></div>
-
-<script>
-const POOLS = {{
-  new: {new_json},
-  hot: {hot_json}
-}};
-const LABEL_COLORS = {label_colors_json};
-
-// ===== Tab 切换 =====
-function switchTab(tab) {{
-  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-  document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-  document.querySelector(`.tab-btn:${{tab === 'new' ? 'first' : 'last'}}-child`).classList.add('active');
-  document.getElementById('tab-' + tab).classList.add('active');
-}}
-
-// ===== 渲染表格 =====
-function createRow(p, pool) {{
-  const tr = document.createElement('tr');
-  const img = p.image ? `<img class="product-img" src="${{p.image}}" loading="lazy" onerror="this.style.display='none'">` : '';
-  const catShort = (p.category || '').split('&')[0].trim();
-  const labelBg = LABEL_COLORS[p.__label__] || '#e9ecef';
-  const sourceLabel = p._source === 'new' ? '🆕新品' : (p._source === 'hot' ? '🔥爆品' : '');
-  const growthClass = (p._growth_note || '').startsWith('🆕') ? 'new' : '';
-  
-  tr.innerHTML = `
-    <td style="text-align:center"><input type="checkbox" class="row-cb" data-asin="${{p.asin}}" data-pool="${{pool}}" onchange="updateCheckCount('${{pool}}')"></td>
-    <td>${{img}}</td>
-    <td>${{catShort}}</td>
-    <td><a href="https://www.amazon.com/dp/${{p.asin}}" target="_blank">${{p.asin}}</a></td>
-    <td>${{p.brand || ''}}</td>
-    <td class="title-cell" title="${{(p.title || '').replace(/"/g, '&quot;')}}">${{p.title || ''}}</td>
-    <td><span class="label-badge" style="background:${{labelBg}}">${{p.__label__ || ''}}</span></td>
-    <td class="num-cell">${{p.sales || ''}}</td>
-    <td class="num-cell">${{p.monthly_sales || ''}}</td>
-    <td class="num-cell price-cell">${{p.price || ''}}</td>
-    <td>${{p.available || ''}}</td>
-    <td class="num-cell rating">${{p.rating || ''}}</td>
-    <td class="num-cell">${{p.reviews || ''}}</td>
-    <td class="num-cell">${{p.bsr || ''}}</td>
-    <td class="num-cell">${{p.variants || ''}}</td>
-    <td><span class="growth-note ${{growthClass}}">${{p._growth_note || ''}}</span></td>`;
-  return tr;
-}}
-
-function renderPool(pool) {{
-  const tbody = document.getElementById(pool + 'Body');
-  tbody.innerHTML = '';
-  POOLS[pool].forEach(p => tbody.appendChild(createRow(p, pool)));
-}}
-
-// ===== 筛选 =====
-// 当前激活的备注筛选状态: {{ pool: 'new'|'grew'|null }}
-const growthFilter = {{}};
-
-function applyFilters(pool) {{
-  const fc = document.querySelector(`.filter-cat[data-pool="${{pool}}"]`).value;
-  const fl = document.querySelector(`.filter-label[data-pool="${{pool}}"]`).value;
-  const fs = document.querySelector(`.filter-search[data-pool="${{pool}}"]`).value.toLowerCase();
-  const gf = growthFilter[pool] || null;
-  
-  const tbody = document.getElementById(pool + 'Body');
-  const rows = tbody.querySelectorAll('tr');
-  let visible = 0;
-  
-  rows.forEach(row => {{
-    const cat = (row.cells[2]?.textContent || '').trim();
-    const label = (row.querySelector('.label-badge')?.textContent || '').trim();
-    const asin = (row.querySelector('a')?.textContent || '').toLowerCase();
-    const brand = (row.cells[4]?.textContent || '').toLowerCase();
-    const title = (row.querySelector('.title-cell')?.textContent || '').toLowerCase();
-    const growthNote = (row.querySelector('.growth-note')?.textContent || '').trim();
-    
-    let show = true;
-    if (fc !== 'all' && !cat.startsWith(fc.split('&')[0].trim())) show = false;
-    if (fl !== 'all' && label !== fl) show = false;
-    if (fs && !(asin.includes(fs) || brand.includes(fs) || title.includes(fs))) show = false;
-    if (gf === 'new' && !growthNote.startsWith('🆕')) show = false;
-    if (gf === 'grew' && !growthNote.startsWith('📈')) show = false;
-    
-    row.style.display = show ? '' : 'none';
-    if (show) visible++;
-  }});
-  
-  document.getElementById(pool + 'Visible').textContent = visible;
-}}
-
-// ===== 点击卡片按备注筛选 =====
-function filterByGrowth(pool, type) {{
-  // null = 清除筛选，点击产品总数时使用
-  if (type === null) {{
-    growthFilter[pool] = null;
-    document.getElementById(pool + 'CardNew').classList.remove('active');
-    document.getElementById(pool + 'CardGrew').classList.remove('active');
-    applyFilters(pool);
-    return;
-  }}
-  // 如果已激活则取消筛选
-  if (growthFilter[pool] === type) {{
-    growthFilter[pool] = null;
-    document.getElementById(pool + 'CardNew').classList.remove('active');
-    document.getElementById(pool + 'CardGrew').classList.remove('active');
-  }} else {{
-    growthFilter[pool] = type;
-    // 高亮对应卡片
-    document.getElementById(pool + 'CardNew').classList.toggle('active', type === 'new');
-    document.getElementById(pool + 'CardGrew').classList.toggle('active', type === 'grew');
-  }}
-  applyFilters(pool);
-}}
-
-// ===== 全选/反选 =====
-function toggleAll(pool) {{
-  const checkAll = document.querySelector(`.check-all[data-pool="${{pool}}"]`);
-  const rows = document.querySelectorAll(`#${{pool}}Body tr`);
-  let anyChecked = false;
-  rows.forEach(row => {{ if (row.style.display !== 'none' && row.querySelector('.row-cb').checked) anyChecked = true; }});
-  
-  // 如果所有可见的都勾选了，则反选；否则全选
-  const targetState = !anyChecked;
-  rows.forEach(row => {{
-    if (row.style.display !== 'none') row.querySelector('.row-cb').checked = targetState;
-  }});
-  checkAll.checked = targetState;
-  updateCheckCount(pool);
-}}
-
-function updateCheckCount(pool) {{
-  const cbs = document.querySelectorAll(`#${{pool}}Body .row-cb:checked`);
-  document.getElementById(pool + 'Selected').textContent = cbs.length;
-}}
-
-// ===== 导出勾选 CSV =====
-function exportSelectedCSV(pool) {{
-  const cbs = document.querySelectorAll(`#${{pool}}Body .row-cb:checked`);
-  if (cbs.length === 0) {{ showToast('请先勾选产品'); return; }}
-  
-  const headers = ['类目','ASIN','品牌','标题','标签','来源','近30天销量','月销售额','售价','上架时间','评分','评论数','BSR','变体数','主图链接','备注'];
-  const selected = [];
-  cbs.forEach(cb => {{
-    const p = POOLS[pool].find(x => x.asin === cb.dataset.asin);
-    if (p) selected.push([p.category||'', p.asin, p.brand||'', p.title||'', p.__label__||'',
-      p._source||'', p.sales||'', p.monthly_sales||'', p.price||'', p.available||'',
-      p.rating||'', p.reviews||'', p.bsr||'', p.variants||'', p.image||'', p._growth_note||'']);
-  }});
-  
-  let csv = '\\uFEFF' + headers.join(',') + '\\n';
-  selected.forEach(r => csv += r.map(v => '"' + (v||'').replace(/"/g, '""') + '"').join(',') + '\\n');
-  
-  const blob = new Blob([csv], {{ type: 'text/csv;charset=utf-8' }});
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url; a.download = 'DuraTech_' + (pool === 'new' ? '新品' : '爆品') + '_勾选_' + new Date().toISOString().slice(0,10) + '.csv';
-  a.click(); URL.revokeObjectURL(url);
-  showToast('已导出 ' + selected.length + ' 条');
-}}
-
-// ===== 转入追踪看板 =====
-function transferToDashboard(pool) {{
-  const cbs = document.querySelectorAll(`#${{pool}}Body .row-cb:checked`);
-  if (cbs.length === 0) {{ showToast('请先勾选要转入的产品'); return; }}
-  if (!confirm('确定将 ' + cbs.length + ' 个产品转入 DuraTech 产品追踪看板吗？')) return;
-  
-  const selected = [];
-  cbs.forEach(cb => {{
-    const p = POOLS[pool].find(x => x.asin === cb.dataset.asin);
-    if (p) {{
-      // 确保标签和来源字段正确
-      p.__label__ = p.__label__ || (pool === 'new' ? '潜力新品' : '标准爆品');
-      p._source = p._source || (pool === 'new' ? 'new' : 'hot');
-      selected.push(p);
-    }}
-  }});
-  
-  // 写入 pending_transfer.json（浏览器无法直接写文件，改为下载 JSON 让用户/AI 处理）
-  // 实际上：浏览器用 Blob 下载 JSON，用户把这个文件放到指定目录
-  const json = JSON.stringify({{ pool: pool, products: selected, transfer_time: new Date().toISOString() }}, null, 2);
-  const blob = new Blob([json], {{ type: 'application/json;charset=utf-8' }});
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = 'pending_transfer_' + new Date().toISOString().slice(0,10) + '.json';
-  a.click();
-  URL.revokeObjectURL(url);
-  
-  showToast('已导出 ' + selected.length + ' 条转入文件！请将下载的 JSON 发给我，我会自动更新追踪看板');
-  
-  // 视觉反馈：已转出的行变灰
-  cbs.forEach(cb => {{ cb.parentElement.parentElement.style.opacity = '0.4'; cb.disabled = true; }});
-}}
-
-// ===== 工具 =====
-function showToast(msg) {{
-  const t = document.getElementById('toast');
-  t.textContent = msg; t.style.display = 'block';
-  setTimeout(() => t.style.display = 'none', 3000);
-}}
-
-// ===== 初始化 =====
-// 填充类目和标签筛选选项
-['new', 'hot'].forEach(pool => {{
-  const cats = new Set();
-  const labels = new Set();
-  POOLS[pool].forEach(p => {{
-    if (p.category) cats.add(p.category.split('&')[0].trim());
-    if (p.__label__) labels.add(p.__label__);
-  }});
-  
-  const catSelect = document.querySelector(`.filter-cat[data-pool="${{pool}}"]`);
-  cats.forEach(c => {{ const opt = document.createElement('option'); opt.value = c; opt.textContent = c; catSelect.appendChild(opt); }});
-  
-  const labelSelect = document.querySelector(`.filter-label[data-pool="${{pool}}"]`);
-  labels.forEach(l => {{ const opt = document.createElement('option'); opt.value = l; opt.textContent = l; labelSelect.appendChild(opt); }});
-  
-  renderPool(pool);
-}});
-{script_extra}
-</script>
-</body>
-</html>"""
+    html = (html
+        .replace("__WEEK__", week_label)
+        .replace("__DATE__", date_str)
+        .replace("__NEW_JSON__", new_json)
+        .replace("__HOT_JSON__", hot_json)
+        .replace("__LABEL_COLORS__", label_colors_json)
+        .replace("__SUB_CAT_TREE__", sub_cat_tree_json)
+        .replace("__HEADER_EXTRA__", header_extra)
+        .replace("__NEW_NEW__", str(new_stats.get('new', 0)))
+        .replace("__NEW_GREW__", str(new_stats.get('grew', 0)))
+        .replace("__HOT_NEW__", str(hot_stats.get('new', 0)))
+        .replace("__HOT_GREW__", str(hot_stats.get('grew', 0)))
+        .replace("__NEW_TOTAL__", str(len(new_products)))
+        .replace("__HOT_TOTAL__", str(len(hot_products)))
+        .replace("__SCRIPT_EXTRA__", script_extra))
 
     Path(output_path).write_text(html, encoding='utf-8')
     print(f"[OK] 需求池看板已生成: {output_path}")

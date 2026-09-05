@@ -21,7 +21,7 @@ echo "📤 上传部署包到服务器..."
 scp "$PKG" "$SERVER:/root/" || { echo "❌ 上传失败（检查网络/密码）"; exit 1; }
 
 echo "🔧 解包并重启服务..."
-ssh "$SERVER" "tar -xzf /root/duratech-deploy.tar.gz -C /workspace && systemctl restart poolboard && sleep 2 && systemctl is-active poolboard && echo '✅ 更新完成'" \
+ssh "$SERVER" "find /workspace/sellersprite-automation -name __pycache__ -type d -prune -exec rm -rf {} + 2>/dev/null; tar -xzf /root/duratech-deploy.tar.gz -C /workspace && systemctl restart poolboard && sleep 3 && systemctl is-active poolboard && echo '✅ 更新完成'" \
   || { echo "❌ 远程执行失败"; exit 1; }
 
 echo ""
